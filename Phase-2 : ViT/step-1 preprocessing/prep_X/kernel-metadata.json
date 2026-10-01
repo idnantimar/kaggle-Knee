@@ -1,0 +1,16 @@
+{
+  "id": "ramitnandi/rsna-knee-prep-x",
+  "title": "rsna-knee-prep-x",
+  "code_file": "prep_X.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "",
+  "dataset_sources": [],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,5 +1,7 @@
 .vscode/
 
 *.ipynb
+
 raw/
+ref/
 **/out/

@@ -1,0 +1,16 @@
+{
+  "id": "ramitnandi/rsna-knee-prep-y",
+  "title": "rsna-knee-prep-y",
+  "code_file": "prep_y.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "",
+  "dataset_sources": ["ramitnandi/rsna-knee-labels-gpt-luna"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": [],
+  "model_sources": []
+}
