@@ -7,8 +7,13 @@ Prepare the training images:
 [4.] Left and Right knees are anatomically mirror images of each other; normalize the data to the Left knee view whenever applicable.
 [5.] Sample a few DICOM files per (StudyInstanceUID, SeriesInstanceUID) rather than processing all MRI slices; mainly to reduce runtime.
 [6.] Store:
-    X.npy --- [n_study, n_slot, N_SLICE, IMG, IMG]
-    catalog.parquet --- (sl, StudyInstanceUID, slot, SeriesInstanceUID, file_name)
+    - X.npy --- [n_study, n_slot, N_SLICE, IMG, IMG]
+    - catalog.parquet --- (sl, StudyInstanceUID, slot, SeriesInstanceUID, file_name)
+    X and catalog have row-by-row correspondence.
+
+CRITICAL ASSUMPTION:
+--------------------
+X must be written in increasing order of (sl, slot).
 
 """
 
@@ -51,8 +56,8 @@ JOB_i = Annotated[
 N_GROUP_MAX = 3 # number of [R|G|B]-like stacks per (StudyInstanceUID, SeriesInstanceUID)
 N_SLICE = 3 * N_GROUP_MAX
 # Total number of slices used per (StudyInstanceUID, SeriesInstanceUID): 3 * N_GROUP_MAX
-SLICE_BAND = (0.15, 0.85) 
-# only the middle 15–85% of each ordered slice stack is sampled per (StudyInstanceUID, SeriesInstanceUID);
+SLICE_BAND = (0.2, 0.8) 
+# only the middle 20–80% of each ordered slice stack is sampled per (StudyInstanceUID, SeriesInstanceUID);
 # edge slices are assumed to contain mostly background noise.
 MID_SLICE_IDX = N_SLICE // 2 # single-slice representative of a (StudyInstanceUID, SeriesInstanceUID)
 
@@ -136,7 +141,7 @@ def _probe(item) -> dict:
 # The actual physical distance is determined by 
 # `PixelSpacing` (row_spacing mm/px, column_spacing mm/px).
  
- # -------------------------
+# -------------------------
 
 
 # ==================================================

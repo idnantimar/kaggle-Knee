@@ -5,6 +5,8 @@ Prepare the training labels:
 - For the remaining studies, use LLM-generated pseudo-labels.
 - Skip samples with ambiguous laterality (~0.9%) during training.
 
+NOTE: This script assumes the LLM output contains no missing values (validated upstream).
+
 """
 
 from pathlib import Path
@@ -34,16 +36,23 @@ y = pd.read_csv(
     # we will use soft labels instead of hard 0-1 labeling
 ).rename(columns=TARGETS, index=str.strip)
 
+ref_flag = y.notna().all(axis=1).rename("ref_flag") # annotated reference studies
+
+
 LLM_out = pd.read_csv(
     INPUT/"datasets/ramitnandi/rsna-knee-labels-gpt-luna/report_labels.csv",
-    index_col="StudyInstanceUID", usecols=["StudyInstanceUID","CLASS","SCORE","classification","hedged","ambiguous_laterality"], 
-    dtype={"StudyInstanceUID":'string', "CLASS":'category', "SCORE":np.float32, "classification":'category', "hedged":bool, "ambiguous_laterality":bool},
+    index_col="StudyInstanceUID", usecols=["StudyInstanceUID","CLASS","SCORE","FINAL_LABEL","classification","hedged","ambiguous_laterality"], 
+    dtype={
+        "StudyInstanceUID":'string', 
+        "CLASS":'category', "SCORE":np.float32, "FINAL_LABEL":bool, "classification":'category', 
+        "hedged":bool, "ambiguous_laterality":bool
+    },
 ).rename(index=str.strip)
 
 # -------------------------
 
 # ==================================================
-# Assign sample weights
+# Assign sample Weights
 # ====================================
 w = y.where(y.isna(), 2.5) 
 LLM_out["W"] = (
@@ -71,7 +80,23 @@ w.rename(columns=lambda x: str(x)+'__w', inplace=True)
 # -------------------------
 
 # ==================================================
-# Overwrite unlabeled UIDs with LLM-generated labels
+# Hard labels for Evaluation 
+# ====================================
+label = y.astype("boolean")
+label_pred = (
+    LLM_out
+    .pivot(
+        columns="CLASS",
+        values="FINAL_LABEL",
+    )
+)
+label.update(label_pred, overwrite=False)
+label.rename(columns=lambda x: str(x)+'__label', inplace=True)
+ 
+# -------------------------
+
+# ==================================================
+# Soft Scoring
 # ====================================
 y_pred = (
     LLM_out
@@ -86,7 +111,7 @@ y.update(y_pred, overwrite=False)
 
 
 pd.concat(
-    [y, w],
+    [y, ref_flag, w, label],
     axis=1,
 ).to_parquet(
     WORKING / "train_y.parquet", index=True, 
