@@ -9,14 +9,14 @@
   "enable_tpu": "false",
   "enable_internet": "false",
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "ramitnandi/rsna-knee-prep-x-out",
+    "ramitnandi/rsna-knee-prep-y-out"
+  ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],
-  "kernel_sources": [
-    "ramitnandi/rsna-knee-prep-x",
-    "ramitnandi/rsna-knee-prep-y"
-  ],
+  "kernel_sources": [],
   "model_sources": [
     "ramitnandi/orthofoundation/pytorch/default/1"
   ]

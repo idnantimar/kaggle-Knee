@@ -9,7 +9,7 @@ train_y.parquet -- (StudyInstanceUID | <target> | <ref> | <weight> | <hard label
 
 Outputs:
 ********
-    model_ft.pt -- state_dict corresponding to the best epoch.
+    model_ft_{A/B}.pt -- state_dict corresponding to the best epoch.
     train.py -- copy of this script, which the final notebook can import.
 
 NOTE: The last few ViT blocks and the MLP head are trainable; all other layers are frozen.
@@ -22,10 +22,15 @@ import gc, hashlib, logging, shutil, time, os
 from pathlib import Path
 
 import numpy as np, pandas as pd
+from sklearn.metrics import roc_auc_score
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from peft import LoraConfig, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
+import peft.tuners.lora.torchao as peft_torchao; peft_torchao.is_torchao_available = lambda: False # suppress unnecessary version conflicts in the Kaggle env.
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +38,7 @@ SEED = 2026
 INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
 DATA_ROOT = INPUT / "competitions/rsna-knee-abnormality-detection"
-PREP_X_OUT, PREP_Y_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-prep-x", INPUT / "notebooks/ramitnandi/rsna-knee-prep-y"
+PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
 ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation"
  
  
@@ -51,12 +56,6 @@ TARGETS = [
 RGB = 3
 
 TIME_BUDGET = 8 * 3600.  # sufficient buffer (compared to the Kaggle session limit of 12h).
-
-def macro_auc(y: np.ndarray, p: np.ndarray) -> float:
-    """Macro ROC-AUC across label columns (excluding degenerate classes)."""
-    return np.nanmean(
-        roc_auc_score(y, p, average=None)
-    )
 
 
 # ==================================================
@@ -128,7 +127,7 @@ def augment(imgs: torch.Tensor) -> torch.Tensor:
         x, grid, 
         mode="bilinear", padding_mode="border", align_corners=False,
     )
-    x = (x * scale).clamp(0, 255).round().to(imgs.dtype)
+    x = (x * scale).clamp(0, 255)
     return x.reshape(*lead, *unit_dim)
 
 # -------------------------
@@ -138,18 +137,20 @@ def augment(imgs: torch.Tensor) -> torch.Tensor:
 # Model
 # ====================================
 DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt"
-TUNE_BLOCKS = 4  
+TUNE_BLOCKS = 4 
+LORA_RANK, LORA_ALPHA = 8, 16
+LORA_TARGETS = ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"]
 ORTHO_ROPE = True 
 
 
-def build_ortho_model(n_slot: int) -> Model:
+def build_ortho_model(n_slot: int) -> _Model:
     """
     DINOv3 ViT-L/16 checkpoint
     ref: https://github.com/ytrsk/OrthoFoundation
     (with continued pretraining on 1.2M knee images)
         ├── early blocks       <frozen>
         ├── ...
-        ├── last TUNE_BLOCKS   <trainable>
+        ├── last TUNE_BLOCKS   <trainable DoRA adapters>
         └── final norm         <trainable>
 
         +
@@ -170,7 +171,7 @@ def build_ortho_model(n_slot: int) -> Model:
         map_location="cpu", weights_only=True,
         # plain dict of tensors.
     )  
-    # NOTE: Different training frameworks may save weights
+    # NOTE: different training frameworks may save weights
     # under different top-level keys (e.g., "teacher", "model", "state_dict", etc.);
     # there may also be different prefixes (e.g., "module.", "backbone.", etc.);
     # since this is a local file, we have manually inspected its structure beforehand:
@@ -183,34 +184,108 @@ def build_ortho_model(n_slot: int) -> Model:
     ViT.load_state_dict(
         state_dict, strict=True
         # STRICT:
-        # The checkpoint tensors must match the ViT-L/16 architecture exactly by name and shape.
+        # the checkpoint tensors must match the ViT-L/16 architecture exactly by name and shape.
     )  
     for param in ViT.parameters():
         param.requires_grad = False
     n_blocks = len(ViT.blocks)
     n_tune = min(n_blocks, TUNE_BLOCKS)
-    for ft_layers in [*ViT.blocks[n_blocks - n_tune:], ViT.norm]:
-        for param in ft_layers.parameters():
-            param.requires_grad = True
+    LoRA_config = LoraConfig(
+        r=LORA_RANK, lora_alpha=LORA_ALPHA, 
+        target_modules=LORA_TARGETS, bias="none",
+        lora_dropout=0.05,
+        use_dora=True,
+        # ref- https://arxiv.org/abs/2402.09353
+    )
+    for block in ViT.blocks[n_blocks - n_tune:]:
+        with torch.no_grad():
+            block.attn.qkv.bias.mul_(block.attn.qkv.bias_mask)
+            # DINOv3 uses shared QKV and masks K-bias during the forward pass,
+            # but PEFT DoRA uses the stored, unmasked bias during weight recomputation;
+            # apply the mask in place before injecting DoRA so both agree.
+            # (the forward output remains unchanged).
+        inject_adapter_in_model(LoRA_config, block)
+    for param in ViT.norm.parameters():
+        param.requires_grad = True
     ViT.eval()
+
     n_ft = sum(p.numel() for p in ViT.parameters() if p.requires_grad) / 1e6
     logger.info(
         f"""
         backbone: OrthoFoundation-L, {n_blocks} blocks,
-        fine-tuning last {n_tune} ({n_ft:.1f}M params), rope={ORTHO_ROPE}
+        DoRA (rank {LORA_RANK}) on last {n_tune} ({n_ft:.2f}M trainable params), rope={ORTHO_ROPE}
         """
     )
-    return Model(ViT, ViT.embed_dim, n_slot)
+    return _Model(ViT, ViT.embed_dim, n_slot)
 
+ 
+class _Model(nn.Module):
+    """ViT backbone + MLP head"""
+ 
+    def __init__(self, backbone, dim, n_slot):
+        super().__init__()
+        self.backbone = backbone
+        self.head = _SlotHead(
+            dim * 2, # [CLS | mean(patches)]
+            n_slot, len(TARGETS),
+        )  
+        # standard ImageNet per-channel RGB mean and standard deviation:
+        shape = (1, 3, 1, 1) # [image, R-G-B, Height, Width]
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(shape))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(shape))
+ 
+    def forward(self, imgs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        imgs [batch_len, n_slots, R-G-B, Height, Width] uint8 or float in [0, 255], mask [batch_len, n_slots] bool -> logits [batch_len, n_out] float
+        """
+        B, S = imgs.shape[:2]
+        filled = mask.reshape(B * S)
+        x = (imgs.reshape(B * S, *imgs.shape[2:])[filled].float() / 255. - self.mean) / self.std
+        cls, patch = self.emb(x) 
+        # only filled slots (~81%) are passed through the backbone.
+        features = torch.cat([cls, patch.mean(dim=1)], dim=1)
+        slot_features = features.new_zeros(B * S, features.shape[1])
+        slot_features[filled] = features
+        return self.head(slot_features.reshape(B, S, -1), mask)
+ 
+    def emb(self, x: torch.Tensor) -> tuple:
+        """
+        The encoder pass of scaled inputs [batch_len * n_slots, R-G-B, Height, Width] happens here.
+        The initial blocks stay frozen; only the last few ViT blocks are fine-tuned.
+        Extracts:
+            CLS [batch_len * n_slots, dim],
+            mean(patches [batch_len * n_slots, n_patch, dim])
+        """
+        ViT = self.backbone
+        k0 = max(len(ViT.blocks) - TUNE_BLOCKS, 0)
+        with torch.no_grad(): ## [[frozen blocks: 0, 1, ..., k0-1]]
+            t, (H, W) = ViT.prepare_tokens_with_masks(x)
+            rope = ViT.rope_embed(H=H, W=W) if (ORTHO_ROPE and ViT.rope_embed is not None) else None
+            for block in ViT.blocks[:k0]:
+                t = block(t, rope)
+        for block in ViT.blocks[k0:]: ## [[fine-tuned layers: k0, k0+1, ...]]
+            t = block(t, rope)
+        t = ViT.norm(t)
+        # [batch_len * n_slots, CLS | storage tokens | patch tokens, dim] embeddings.
+        return t[:, 0].float(), t[:, -(H * W):].float()
+ 
+    def train(self, mode=True):
+        """
+        - backbone always in `eval` mode (no dropout / stochastic depth).
+        - head in `train` mode if mode=True.
+        """
+        super().train(mode)
+        self.backbone.eval()  
+        return self
 
-class SlotHead(nn.Module):
+class _SlotHead(nn.Module):
     """
     Each StudyInstanceUID contains multiple slots with varying configurations, each contributing an RGB-like stack during an encoder pass.
 
     Not all image slots are equally important for each diagnosis.
     e.g.,
-    - Cruciate ligaments and menisci are well evaluated on sagittal and coronal images, while patellofemoral cartilage is better evaluated on axial images.
-    - Fluid-sensitive sequences with fat suppression are central to detecting edema, effusion, and tears.
+    - Cruciate ligaments and menisci are well evaluated on sagittal/coronal images, while patellofemoral cartilage is better evaluated on axial images.
+    - Fluid-sensitive sequences with fat suppression are central to detecting edema, effusion.
 
     SlotHead serves as a diagnosis-specific attention pooling layer: 
     instead of averaging the slot embeddings, it learns to assign different weights to different slots for each diagnosis.
@@ -253,8 +328,10 @@ class SlotHead(nn.Module):
             torch.einsum(
                 "bsh,oh->bos", x_, self.query,
                 # (label, slot)-wise weighted sum of features.
-            ) / self.hidden ** 0.5
-        ).masked_fill(~mask, -1e4).softmax(-1)
+            ) / (self.hidden ** 0.5)
+        ).masked_fill(~mask, -1e4).softmax(dim=-1)
+        # - `softmax` ensures w sums to 1 across slots.
+        # - `masked_fill` ensures w=0 for empty slot placeholders.
         wx = torch.einsum(
             "bos,bsh->boh", w, x_,
             # label-wise weighted average of slot embeddings.
@@ -262,64 +339,6 @@ class SlotHead(nn.Module):
         # logit for each diagnosis is derived independently from its corresponding embedding row;
         # different label classes do not interact with each other.
         return torch.einsum("boh,oh->bo", self.drop(wx), self.out.weight) + self.out.bias
-
- 
-class Model(nn.Module):
-    """ViT backbone + MLP head"""
- 
-    def __init__(self, backbone, dim, n_slot):
-        super().__init__()
-        self.backbone = backbone
-        self.head = SlotHead(
-            dim * 2, # [CLS | mean(patches)]
-            n_slot, len(TARGETS),
-        )  
-        # standard ImageNet per-channel RGB mean and standard deviation:
-        shape = (1, 3, 1, 1) # [image, R-G-B, Height, Width]
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(shape))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(shape))
- 
-    def forward(self, imgs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        imgs [batch_len, n_slots, R-G-B, Height, Width] uint, mask [batch_len, n_slots] bool -> logits [batch_len, n_out] float
-        """
-        B, S = imgs.shape[:2]
-        x = (imgs.reshape(B * S, *imgs.shape[2:]).float().div_(255.) - self.mean) / self.std
-        cls, patch = self.emb(x) 
-        return self.head(
-            torch.cat([cls, patch.mean(1)], dim=1).reshape(B, S, -1), 
-            mask,
-        )
- 
-    def emb(self, x: torch.Tensor) -> tuple:
-        """
-        The encoder pass of scaled inputs [batch_len * n_slots, R-G-B, Height, Width] happens here.
-        The initial blocks stay frozen; only the last few ViT blocks are fine-tuned.
-        Extracts:
-            CLS [batch_len * n_slots, dim],
-            mean(patches [batch_len * n_slots, n_patch, dim])
-        """
-        ViT = self.backbone
-        k0 = max(len(ViT.blocks) - TUNE_BLOCKS, 0)
-        with torch.no_grad(): ## [[frozen blocks: 0, 1, ..., k0-1]]
-            t, (H, W) = ViT.prepare_tokens_with_masks(x)
-            rope = ViT.rope_embed(H=H, W=W) if (ORTHO_ROPE and ViT.rope_embed is not None) else None
-            for block in ViT.blocks[:k0]:
-                t = block(t, rope)
-        for block in ViT.blocks[k0:]: ## [[fine-tuned layers: k0, k0+1, ...]]
-            t = block(t, rope)
-        t = ViT.norm(t)
-        # [batch_len * n_slots, CLS | storage tokens | patch tokens, dim] embeddings.
-        return t[:, 0].float(), t[:, -(H * W):].float()
- 
-    def train(self, mode=True):
-        """
-        - backbone always in `eval` mode (no dropout / stochastic depth).
-        - head in `train` mode if mode=True.
-        """
-        super().train(mode)
-        self.backbone.eval()  
-        return self
  
 # -------------------------
 
@@ -348,7 +367,14 @@ def predict(
     n_slice = X.shape[-3]
     is_cuda = dev.type == "cuda"
     out = []
-    for b in range(0, len(idx), EVAL_BATCH):
+    lora_layers = [module for module in model.modules() if isinstance(module, LoraLayer)]
+    base_weights = [layer.base_layer.weight.detach().clone() for layer in lora_layers]
+    for layer in lora_layers:
+        layer.merge()
+        # fold LoRA into the base weight once,
+        # instead of recomputing ||W + BA|| on every eval forward pass for `len(idx)`.
+
+    for b in range(0, len(idx), EVAL_BATCH): # [[MAIN]]
         uid = idx[b:b + EVAL_BATCH]
         m = torch.from_numpy(mask[uid]).to(dev)
         logits = []
@@ -358,19 +384,46 @@ def predict(
             ).to(dev)
             with torch.autocast("cuda", enabled=is_cuda):
                 logits.append(model(X_g, m).float())
-        out.append(torch.stack(logits, dim=1))  
-    ## [len(idx), n_group, n_out] --mean over groups--> 
+        out.append(torch.stack(logits, dim=-1))  
+
+    for layer, base_weight in zip(lora_layers, base_weights):
+        layer.unmerge()
+        # restore the exact frozen weights before resuming training;
+        # `unmerge` alone may introduce round-off errors.
+        layer.base_layer.weight.data.copy_(base_weight)
+
+    ## [len(idx), n_out, n_group] --mean over groups--> 
     ##      [len(idx), n_out] --sigmoid (element-wise)--> probabilities.
     if not out:
         return np.zeros((0, len(TARGETS)), np.float32)
-    return torch.cat(out).mean(dim=1).sigmoid().cpu().numpy()
+    return torch.cat(out).mean(dim=-1).sigmoid().cpu().numpy()
  
 
 EPOCHS = 10
 BATCH_STUDIES = 8
-LR_HEAD, LR_BACKBONE, WEIGHT_DECAY = 1e-3, 2e-5, 0.02
+LR_HEAD, LR_BACKBONE = 1e-3, 2e-4
+RUNS = {
+    "A": (0, 1, 2), 
+    "B": (2, 3, 4),
+    # run -> training folds (3/5); 
+    # the remaining (2/5) folds are held out.
+} ## NOTE: every fold is used at least once for training.
 
-def main():
+def train_run(rank: int):
+    """
+    One run per GPU (cuda:rank),
+    launched in parallel via torch.multiprocessing.spawn(...).
+    """
+    run_name = chr(rank + 65)
+    # name [0, 1, ...] ---> [A, B, ...]
+    train_folds = RUNS[run_name]
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [{run_name}] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
     T0 = time.time()
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -406,27 +459,30 @@ def main():
             ) % 5
             for r in report.loc[mask_index]
         ]
-        # deterministic bucketing: 0 | 1, 2, 3, 4;
+        # deterministic bucketing into 5 folds;
         # duplicate reports get the same bucket to avoid leakage.
     )  
-    validation_set = np.flatnonzero(~skip & (folds == 0))
-    train_set = np.flatnonzero(~skip & (folds != 0))
+    in_train_folds = np.isin(folds, train_folds)
+    validation_set = np.flatnonzero(~skip & ~in_train_folds)
+    train_set = np.flatnonzero(~skip & in_train_folds)
     n_train, n_validation = len(train_set), len(validation_set)
-    logger.info(f"train {n_train} / holdout {n_validation} studies")
-
-    validation_ref = validation_set[ref[validation_set]] # indices out of the validation set that have reference labels.
-    val_ref_labels = labels[validation_ref]
-    n_val_ref = len(validation_ref)
-    logger.info(f"annotation check: {n_val_ref} of {ref.sum()} annotated studies are in the holdout")
+    logger.info(f"train folds {train_folds}: train {n_train} / holdout {n_validation} studies.")
     val_labels = labels[validation_set] 
     # NOTE: hard-labels are only used for validation AUC tracking;
     # training loss is always derived from soft-scores.
 
+    is_val_ref = ref[validation_set] 
+    validation_ref = validation_set[is_val_ref]
+    # indices in the validation set that have reference labels.
+    val_ref_labels = labels[validation_ref]
+    n_val_ref = len(validation_ref)
+    logger.info(f"annotation check: {n_val_ref} of {ref.sum()} annotated studies are in the holdout.")
     ## ----
 
     ## -- fine-tuning ----
-    has_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if has_cuda else "cpu")
+    has_cuda = True
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
     scaler = torch.amp.GradScaler("cuda", enabled=has_cuda)
     model = build_ortho_model(n_slot=X.shape[1]).to(device)
     trainable = {name for name, param in model.named_parameters() if param.requires_grad}
@@ -434,12 +490,13 @@ def main():
         [
             {"params": model.head.parameters(), "lr": LR_HEAD},
             {"params": [param for param in model.backbone.parameters() if param.requires_grad], "lr": LR_BACKBONE},
-        ], weight_decay=WEIGHT_DECAY,
+        ], weight_decay=0.02,
     )
-    steps = max(EPOCHS * (n_train // BATCH_STUDIES), 1)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=[LR_HEAD, LR_BACKBONE],
-        total_steps=steps, pct_start=0.15,
+        epochs=EPOCHS,
+        steps_per_epoch=max(n_train // BATCH_STUDIES, 1), 
+        pct_start=0.15,
     )
     
     best, best_state = -1.0, None
@@ -479,16 +536,16 @@ def main():
             tot += loss.item()
             nstep += 1
  
-        holdout_auc = macro_auc(
-            val_labels, 
-            predict(model, X, mask, validation_set, device)
-        )
-        holdout_ref_auc = macro_auc(
-            val_ref_labels, 
-            predict(model, X, mask, validation_ref, device)
-        ) if len(validation_ref) else np.nan
+        holdout_pred = predict(model, X, mask, validation_set, device)
+        holdout_label_auc = roc_auc_score(val_labels, holdout_pred, average=None) 
+        holdout_auc = np.nanmean(holdout_label_auc)
+        holdout_ref_auc = np.nanmean(roc_auc_score(val_ref_labels, holdout_pred[is_val_ref], average=None)) if n_val_ref else np.nan
+        label_auc_text = "; ".join(f"{target} {auc:.4f}" for target, auc in zip(TARGETS, holdout_label_auc))
         logger.info(
-            f"""EPOCH {epoch + 1}/{EPOCHS} | loss {tot / max(nstep, 1):.4f}; holdout auc {holdout_auc:.4f}; holdout annotated studies(n={n_val_ref}) auc {holdout_ref_auc:.4f};""")
+            f"""
+            EPOCH {epoch + 1}/{EPOCHS} | loss {tot / max(nstep, 1):.4f} | holdout macro auc {holdout_auc:.4f} | annotated studies (n={n_val_ref}) macro auc {holdout_ref_auc:.4f}
+            holdout auc per label: {label_auc_text}"""
+        )
                 
         # best epoch is chosen based on full holdout AUC;
         # the annotated reference studies (~ 1.3% * 1/5) are too few to make a decision.
@@ -500,8 +557,8 @@ def main():
             logger.info("time budget reached")
             break
  
-    torch.save(best_state, WORKING / "model_ft.pt")
-    logger.info(f"best holdout AUC {best:.4f}; saved model_ft.pt")
+    torch.save(best_state, WORKING / f"model_ft_{run_name}.pt")
+    logger.info(f"best holdout AUC {best:.4f}; saved model_ft_{run_name}.pt")
     del model, opt, scheduler, scaler
     gc.collect()
     ## ----
@@ -522,5 +579,6 @@ if __name__ == "__main__":
         force=True,
     )
 
-    main()
+    assert torch.cuda.device_count() >= len(RUNS), f"""need {len(RUNS)} GPUs, found {torch.cuda.device_count()}."""
+    torch.multiprocessing.spawn(train_run, nprocs=len(RUNS), join=True)
     shutil.copy(__file__, WORKING / "train.py")
