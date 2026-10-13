@@ -12,7 +12,7 @@ Outputs:
 Design: @idnantimar
 -------
 - OpenAI Responses API
-- GPT-5.6 Luna
+- GPT-6 Luna
 - moderate reasoning effort for semantic clinical interpretation
 - strict Structured Outputs / JSON Schema
 - mandatory Pydantic audit
@@ -60,10 +60,10 @@ PROMPT_PATH = BASE_DIR / "input" / "RSNA Knee Abnormality Detection — MULTILIN
 EXAMPLES_PATH = BASE_DIR / "input" / "few_shot_examples.jsonl"
 OUTPUT_JSONL = BASE_DIR / "out" / "report_labels_api.jsonl"
 
-MODEL_NAME = "gpt-5.6-luna"
+MODEL_NAME = "gpt-6-luna"
 # designed for cost-sensitive, high-volume workloads;
-# cost-effective compared to old generation 5.5 etc.
-# (see https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+# cost-effective compared to old generations.
+# (see https://developers.openai.com/api/docs/models/gpt-6-luna)
 
 REASONING_EFFORT = "medium" 
 # this is semantic clinical interpretation task, not fix-keyword classification.
@@ -87,7 +87,7 @@ class _Finding(BaseModel):
     # validate individual key-value pairs
     classification: Literal["POSITIVE", "NEGATIVE", "NA"]
     severity: Literal["LOW", "MEDIUM", "HIGH"] | None
-    hedged: bool
+    hedged: bool | None
     evidence: str | None
 
     # validate cross-keys consistency
@@ -96,13 +96,15 @@ class _Finding(BaseModel):
         if self.classification == "NA":
             if self.severity is not None:
                 raise ValueError("NA requires severity=null")
-            if self.hedged:
-                raise ValueError("NA requires hedged=false")
+            if self.hedged is not None:
+                raise ValueError("NA requires hedged=null")
             if self.evidence is not None:
                 raise ValueError("NA requires evidence=null")
         else:
             if self.evidence is None:
                 raise ValueError("POSITIVE/NEGATIVE requires evidence")
+            if self.hedged is None:
+                raise ValueError("POSITIVE/NEGATIVE requires hedged=true/false")
             if self.classification == "NEGATIVE" and self.severity is not None:
                 raise ValueError("NEGATIVE requires severity=null")
             if self.classification == "POSITIVE" and self.severity is None:
@@ -277,7 +279,7 @@ def classify_one(
             store=False, 
             prompt_cache_key="knee-report-classifier-v0",
             prompt_cache_options={"mode": "explicit"},
-            # gpt-5.6 handles cache routing automatically 
+            # gpt-6 handles cache routing automatically 
             # (see https://developers.openai.com/api/docs/guides/prompt-caching)
             text_format=LLM_OUTPUT,
             metadata={"UID":study_uid},

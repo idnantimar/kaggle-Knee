@@ -23,29 +23,29 @@ severity is tagged as HIGH by default.
 
 
 NOTE: The annotated reference set is <2% of the total training set; 
-Any empirical estimate of the form 
-    P(abnormality | category of report) 
-derived from this reference set may not generalize to the full dataset, 
+Any empirical estimate of the form P(abnormality | category of report) derived from this reference set may not generalize to the full dataset, 
 especially if the reference set was hand-picked to showcase all 12 label classes. 
-Therefore, 
-we only encode the ordinal information of the categories in an uncalibrated score between 0 - 1:
+Therefore, we only encode the ordinal information of the categories in an uncalibrated score between 0 - 1:
     NEGATIVE < NA < LOW < MEDIUM < HIGH
 
 """
 
 
-import polars as pl, pandas as pd
+import polars as pl, pandas as pd, numpy as np
 from pathlib import Path
 import logging
 from sklearn.metrics import roc_auc_score
 
 
 logger = logging.getLogger(__name__)
-
+RANDOM_SEED = 42
 
 
 BASE_DIR = Path(__file__).parent
-IN_PATH = BASE_DIR.parent / "step-1 extract labels" / "out" / "report_labels_api.jsonl"
+IN_PATHS = {
+    "A": BASE_DIR.parent / "step-1 extract labels" / "out" / "report_labels_api-run1.jsonl",
+    "B": BASE_DIR.parent / "step-1 extract labels" / "out" / "report_labels_api-run2.jsonl",
+}
 REF_PATH = BASE_DIR / "input" / "gold_labels.csv"
 OUTPUT_CSV = BASE_DIR / "out" / "report_labels.csv"
 
@@ -63,17 +63,18 @@ THRESHOLDS = {
     "Contusion": ALL, "Fracture": ALL,
 }
 SCORE = {
-    "POSITIVE_HIGH": 1.-1e-6,
+    "POSITIVE_HIGH": 1.,
     "POSITIVE_MEDIUM": 0.8,
     "POSITIVE_LOW": 0.6,
-    "NEGATIVE": 0.+1e-6,
+    "NEGATIVE": 0.,
     "NA": 0.2,
-    # HIGH/MEDIUM/LOW has a natural semantic ordering;
-    # when something is not mentioned, 
-    # it is scored a bit higher than something explicitly discarded;
-    # the ordering: NEGATIVE < NA < LOW < MEDIUM < HIGH
+    # HIGH/MEDIUM/LOW or POSITIVE/NEGATIVE has a natural semantic ordering;
 }
-
+HEDGE_PENALTY = (
+    pl.when(pl.col.classification.eq("POSITIVE")).then(0.05)
+      .when(pl.col.classification.eq("NEGATIVE")).then(-0.05)
+    .otherwise(0)
+)
 
 ABNORMALITY_CLASSES = {
     "ACL":'''ACL''', "MCL":'''MCL''',
@@ -108,7 +109,7 @@ REPORT_SCHEMA = {
 }
 
 
-def load_report_labels(path: Path) -> pl.DataFrame:
+def load_report_labels(path: Path) -> pl.LazyFrame:
     DATA = pl.scan_ndjson(
         path, 
         schema=REPORT_SCHEMA, infer_schema_length=None,
@@ -125,28 +126,9 @@ def load_report_labels(path: Path) -> pl.DataFrame:
             value_name="temp"
         )
         .unnest("temp")  
-    ).with_columns(
-        pl.col.severity.is_in(
-            pl.col.CLASS.replace_strict(THRESHOLDS), 
-            nulls_equal=True
-        ).alias("FINAL_LABEL"),
-        # determined by the combination of (classification, severity)
-        # Ref: https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/discussion/733343
-        pl.concat_str(
-            ["classification", "severity"],
-            separator='_',
-            ignore_nulls=True,
-        ).replace_strict(SCORE).alias("SCORE"),
-        # we only encode the ordinal information of the categories in an uncalibrated score between 0 - 1:
-        #   NEGATIVE < NA < LOW < MEDIUM < HIGH
-    )
+    ).with_columns(pl.col(pl.String).str.strip_chars())
 
-    return DATA.sort(
-        [
-            "StudyInstanceUID",
-            pl.col.CLASS.replace_strict(LABELS)
-        ]
-    ).collect()
+    return DATA
 
 
 # --------------------------------------------------------------------
@@ -160,17 +142,63 @@ if __name__ == "__main__":
     )
 
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    labels = load_report_labels(IN_PATH)
+    run_a, run_b = load_report_labels(IN_PATHS["A"]), load_report_labels(IN_PATHS["B"])
+    labels = run_a.join(
+        run_b,
+        on=["StudyInstanceUID", "CLASS"],
+        how="inner", validate="1:1", maintain_order="left",
+        suffix="_",
+    ).collect()
+    run_a_size, run_b_size = (run.select(pl.len()).collect().item() for run in (run_a, run_b))
+    assert labels.height == run_a_size == run_b_size, f"runs do not cover the same UIDs: A={run_a_size}, B={run_b_size}, matched={labels.height}"
+
+    agree = pl.all_horizontal(
+        pl.col(field).eq_missing(pl.col(f"{field}_"))
+        for field in ["classification", "severity", "hedged"]
+    )
+    pick_ab = pl.Series(np.random.default_rng(RANDOM_SEED).random(labels.height) < 0.5)
+    labels = labels.select(
+        "StudyInstanceUID", "CLASS",
+        *[
+            pl.when(pick_ab).then(field).otherwise(f"{field}_").alias(field)
+            for field in ["classification", "severity", "hedged"]
+        ],
+        # when (classification, severity, hedged) disagree, pick A/B randomly;
+        # for matched cases, they produce the same value anyway.
+        (pl.col.ambiguous_laterality | pl.col.ambiguous_laterality_).alias("ambiguous_laterality"),
+        # if at least one finding is ambiguous_laterality, keep it.
+        pl.format(
+            "A| {}\n\nB| {}",
+            pl.col.evidence.fill_null(""), pl.col.evidence_.fill_null(""),
+        ).alias("evidence"),
+        pl.when(agree).then(1.).otherwise(1 / 2**0.5).alias("weight"),
+        # downweight samples where A/B disagree.
+    ).with_columns(
+        pl.col.severity.is_in(
+            pl.col.CLASS.replace_strict(THRESHOLDS), 
+            nulls_equal=True
+        ).alias("FINAL_LABEL"),
+        # determined by the combination of (classification, severity)
+        # Ref: https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/discussion/733343
+        (
+            pl.concat_str(["classification", "severity"], separator='_', ignore_nulls=True).replace_strict(SCORE)
+            - HEDGE_PENALTY * pl.col.hedged.fill_null(False)
+        ).alias("SCORE"),
+        # we only encode the ordinal information of the categories in an uncalibrated score between 0 - 1:
+        #   NEGATIVE < NEGATIVE_hedged < NA < LOW_hedged < LOW < MEDIUM_hedged < MEDIUM < HIGH_hedged < HIGH
+    ).sort(
+        [
+            "StudyInstanceUID",
+            pl.col.CLASS.replace_strict(LABELS)
+        ] 
+    )
+
     labels.write_csv(OUTPUT_CSV)
     logger.info(f"""Wrote {labels.n_unique("StudyInstanceUID")} UIDs to {OUTPUT_CSV}""")
+    agreement_count = labels.filter(pl.col.weight == 1).height
+    logger.info(f"""run 1 & 2 agree [{agreement_count}/{labels.height}] ({100*agreement_count/labels.height:.2f}%)""")
     logger.info(f"""ambiguous laterality: {labels.filter("ambiguous_laterality").n_unique("StudyInstanceUID")}""")
-    PREVALENCE = labels.group_by(
-        "CLASS", maintain_order=True
-    ).agg(
-        (100*pl.col.FINAL_LABEL.mean()).alias("prevalence")
-    )
-    logger.info(f"""\nprevalence\n{pd.Series(PREVALENCE["prevalence"], index=PREVALENCE["CLASS"]).round(2)}\n""")
-
+    
 
     # ======= AUC =======================================
     REF = pd.read_csv(

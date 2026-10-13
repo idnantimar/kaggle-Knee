@@ -41,71 +41,49 @@ ref_flag = y.notna().all(axis=1).rename("ref_flag") # annotated reference studie
 
 LLM_out = pd.read_csv(
     INPUT/"datasets/ramitnandi/rsna-knee-labels-gpt-luna/report_labels.csv",
-    index_col="StudyInstanceUID", usecols=["StudyInstanceUID","CLASS","SCORE","FINAL_LABEL","classification","hedged","ambiguous_laterality"], 
+    index_col="StudyInstanceUID", usecols=["StudyInstanceUID","CLASS","SCORE","FINAL_LABEL","weight","ambiguous_laterality"], 
     dtype={
         "StudyInstanceUID":'string', 
-        "CLASS":'category', "SCORE":np.float32, "FINAL_LABEL":bool, "classification":'category', 
-        "hedged":bool, "ambiguous_laterality":bool
+        "CLASS":'category', "SCORE":np.float32, "FINAL_LABEL":bool, 
+        "weight":np.float32, "ambiguous_laterality":bool
     },
 ).rename(index=str.strip)
+
+LLM_out = LLM_out.pivot(
+    columns="CLASS",
+    values=["SCORE", "FINAL_LABEL", "weight", "ambiguous_laterality"],
+)
 
 # -------------------------
 
 # ==================================================
 # Assign sample Weights
 # ====================================
-w = y.where(y.isna(), 2.5) 
-LLM_out["W"] = (
-    np.where(
-        LLM_out["classification"].notna(),
-        1 - 0.2*LLM_out["hedged"],
-        0.5
-    ) 
+w = (
+    LLM_out["weight"].reindex_like(y)
+    .where(y.isna(), 2.5)
+    .astype(np.float32)
+    .mask(LLM_out["ambiguous_laterality"].astype(bool), 0)
+    .add_suffix("__w")
 )
-w_pred = (
-    LLM_out
-    .pivot(
-        columns="CLASS",
-        values=["W", "ambiguous_laterality"],
-    )
-)
-w.update(w_pred["W"].astype(np.float32), overwrite=False)
-w.mask(
-    w_pred["ambiguous_laterality"].astype(bool),
-    0,
-    inplace=True,
-)
-w.rename(columns=lambda x: str(x)+'__w', inplace=True)
 
 # -------------------------
 
 # ==================================================
 # Hard labels for Evaluation 
 # ====================================
-label = y.astype("boolean")
-label_pred = (
-    LLM_out
-    .pivot(
-        columns="CLASS",
-        values="FINAL_LABEL",
-    )
+label = (
+    y.astype("boolean")
+    .fillna(LLM_out["FINAL_LABEL"].astype("boolean"))
+    .add_suffix("__label")
 )
-label.update(label_pred, overwrite=False)
-label.rename(columns=lambda x: str(x)+'__label', inplace=True)
- 
+
 # -------------------------
 
 # ==================================================
 # Soft Scoring
 # ====================================
-y_pred = (
-    LLM_out
-    .pivot(
-        columns="CLASS",
-        values="SCORE",
-    )
-)
-y.update(y_pred, overwrite=False)
+y = y.fillna(LLM_out["SCORE"].astype(np.float32))
 
 # -------------------------
 

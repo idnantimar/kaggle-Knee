@@ -15,15 +15,18 @@ SUBMISSION:
 
     --predict--> submission.csv
 
+NOTE: This script assumes each input returns a non-null prediction (validated upstream).
+
 """
 
-import logging, sys, traceback
+import logging, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import rankdata
 
 INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
@@ -66,23 +69,19 @@ def main() -> pd.DataFrame:
         run_pred = predict(model, X, mask, np.arange(N), dev) # [[MAIN]]
 
         logger.info(f"run {run_name}: predicted {N} studies on {dev}")
-        del model
-        torch.cuda.empty_cache()
         return run_pred
 
+    ## -- (T4 x2: A on cuda:0, B on cuda:1) ----
     n_gpu = torch.cuda.device_count()
     devices = [torch.device(f"cuda:{i % n_gpu}") if n_gpu else torch.device("cpu") for i in range(N_SUBMIT)] 
     with ThreadPoolExecutor(max_workers=min(n_gpu or 1, N_SUBMIT)) as pool:
         run_preds = pool.map(predict_run, SUBMIT_RUNS, devices)
-        # (T4 x2: A on cuda:0, B on cuda:1)
+    ## ---- 
 
+    ## -- rank ensemble --
     out = np.mean(
         [
-            (
-                pd.DataFrame(run_pred)
-                .rank(method='average')
-                .to_numpy()
-            )
+            rankdata(run_pred, axis=0) 
             for run_pred in run_preds
         ], axis=0,
         # given our predicted probabilities are not calibrated,
@@ -91,14 +90,11 @@ def main() -> pd.DataFrame:
         #
         # NOTE: this competition only rewards macro-AUC.
     )
+    ## ----
 
-    return pd.DataFrame(out/N, index=mask_index, columns=TARGETS)
+    return pd.DataFrame(out/N, index=mask_index, columns=TARGETS) # [normalize output to the range 0–1]
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(relativeCreated)8.0fms] %(message)s", force=True)
-    try:
-        submit = main()
-        submit.to_csv(WORKING / "submission.csv")
-    except Exception:
-        traceback.print_exc()  
+    main().to_csv(WORKING / "submission.csv")
