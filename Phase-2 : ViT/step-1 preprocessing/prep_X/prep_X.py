@@ -6,14 +6,15 @@ Prepare the training images:
 [3.] Order the DICOM files by their physical coordinates rather than file names, under every (StudyInstanceUID, SeriesInstanceUID).
 [4.] Left and Right knees are anatomically mirror images of each other; normalize the data to the Left knee view whenever applicable.
 [5.] Sample a few DICOM files per (StudyInstanceUID, SeriesInstanceUID) rather than processing all MRI slices; mainly to reduce runtime.
-[6.] Store:
-    - X.npy --- [n_study, n_slot, N_SLICE, IMG, IMG]
-    - catalog.parquet --- (sl, StudyInstanceUID, slot, SeriesInstanceUID, file_name)
+[6.] Produce:
+    - `X` --- [n_study, n_slot, N_SLICE, IMG, IMG]
+    - `catalog` --- (sl, StudyInstanceUID, slot, SeriesInstanceUID, file_name)
     X and catalog have row-by-row correspondence.
 
 CRITICAL ASSUMPTION:
 --------------------
-X must be written in increasing order of (sl, slot).
+`X` must be ordered by (sl, slot) in ascending order.
+Hence, each StudyInstanceUID occupies a fixed block of n_slot * N_SLICE rows in the `catalog`.
 
 """
 
@@ -367,6 +368,10 @@ META_COLS = {
 }
 
 
+def _placeholder(sl, study, slot, series=None) -> list[dict]:
+    # N_SLICE metadata rows for a slot without decoded images.
+    return [{"sl": sl, "StudyInstanceUID": study, "slot": slot, "SeriesInstanceUID": series} for _ in range(N_SLICE)]
+
 def read_Series(job_row: JOB_i) -> tuple[BUFFER | None, list[dict]]:
     """
     Stack multiple representative MRI slices corresponding to a given (StudyInstanceUID, SeriesInstanceUID)
@@ -378,13 +383,13 @@ def read_Series(job_row: JOB_i) -> tuple[BUFFER | None, list[dict]]:
 
     if HEADER_UIDrow is None:
         # no series picked for the given slot
-        return None, [{"sl": sl, "StudyInstanceUID": study, "slot": slot}] * N_SLICE
+        return None, _placeholder(sl, study, slot)
 
     series = HEADER_UIDrow.name[-1]
     files_ordered = _order_slices(HEADER_UIDrow)
     if not files_ordered:
         # no files to decode
-        return None, [{"sl": sl, "StudyInstanceUID": study, "slot": slot, "SeriesInstanceUID": series}] * N_SLICE
+        return None, _placeholder(sl, study, slot, series)
     
     n_1 = len(files_ordered) - 1
     lo, hi = np.floor(SLICE_BAND[0] * n_1), np.ceil(SLICE_BAND[1] * n_1)
@@ -399,7 +404,7 @@ def read_Series(job_row: JOB_i) -> tuple[BUFFER | None, list[dict]]:
     }
     if not decoded:
         # no slice from the series could be decoded
-        return None, [{"sl": sl, "StudyInstanceUID": study, "slot": slot, "SeriesInstanceUID": series}] * N_SLICE
+        return None, _placeholder(sl, study, slot, series)
     planes = []
     metadata = []
     for i in idx:
@@ -433,7 +438,7 @@ def read_Series(job_row: JOB_i) -> tuple[BUFFER | None, list[dict]]:
             ]
         ),
         [1, 99],
-    )
+    ).astype(np.float32)
     scale = max(hi_v - lo_v, 1e-6) / 255 # [[8-bit greyscale 0-255]]
 
     # stack the slices under a given (StudyInstanceUID, SeriesInstanceUID)
@@ -492,9 +497,19 @@ CHUNK = 1024
 PIX_PROCESS = os.cpu_count()
 
  
-def main(split: str, out: Path):
+def main(split: str, out: Path | None = None) -> tuple | None:
     """
-    {split}_series --> out/X.npy, out/catalog.parquet written to disk
+    {split}_series --> X.npy, catalog.parquet
+
+    . for `train`:
+    --------------
+        large number of observations;
+        dump preprocessed data to disk for reuse across epochs via memmap.
+
+    . for `test`:
+    -------------
+        comparatively small number of observations;
+        preprocessed data fits comfortably in RAM, allowing a single forward pass without memmap overhead.
     """
     header = HEADERS(split) # series-level info
     studies = pick_slots(header)
@@ -503,14 +518,20 @@ def main(split: str, out: Path):
     logger.info(f"{len(studies)} study; {len(header)} series.")  
 
     ## -- allocate memory ----
-    out.mkdir(parents=True, exist_ok=True)
-    X = np.lib.format.open_memmap(
-        out / f"{split}_X.npy", mode="w+", dtype=np.uint8,
-        shape=(len(studies), len(SLOTS), N_SLICE, CACHE_IMG, CACHE_IMG),
-        # [[X can be several GB in size]]
-        # avoid loading the entire array into RAM.
-        # keep the data on disk and access it through a memory-mapped array.
-    )
+    X_shape = (len(studies), len(SLOTS), N_SLICE, CACHE_IMG, CACHE_IMG)
+    if split == "train":
+        out.mkdir(parents=True, exist_ok=True) # `out` is only used for train.
+        X = np.lib.format.open_memmap(
+            out / f"{split}_X.npy", mode="w+", dtype=np.uint8,
+            shape=X_shape,
+            # [[X can be several GB in size]]
+            # avoid loading the entire array into RAM.
+            # keep the data on disk and access it through a memory-mapped array.
+        )
+    else:
+        X = np.zeros(X_shape, dtype=np.uint8)
+        # test set is small enough;
+        # keep X in RAM to avoid disk round-trips.
     meta_X = []
     # X only captures the pixel array;
     # UID + metadata (e.g., height, width, laterality, geometry etc.)
@@ -540,7 +561,7 @@ def main(split: str, out: Path):
             block = jobs[c0:c0 + CHUNK]
             current_out = pool.map(
                 read_Series, block, 
-                chunksize=8, 
+                chunksize=4, 
             )
             for (sl, _, slot, _), (img, meta) in zip(block, current_out):
                 meta_X.extend(meta)
@@ -548,7 +569,8 @@ def main(split: str, out: Path):
                     X[sl, slot] = img
                     c += 1
             logger.info(f"decoded jobs: {c0} - {min(c0 + CHUNK, num_jobs)} | success {c}")
-    X.flush()
+    if isinstance(X, np.memmap):
+        X.flush()
     meta_X = (
         pd.DataFrame(meta_X)
         .astype(META_COLS)
@@ -558,10 +580,11 @@ def main(split: str, out: Path):
     # - file_name is None when decoding fails.
     # The placeholder for UID still exists for consistency with X.
     catalog = ["sl", "StudyInstanceUID", "slot", "SeriesInstanceUID", "file_name"]
-    meta_X[catalog].to_parquet(
-        out / f"{split}_catalog.parquet",
-        compression='zstd',
-    )
+    if split == "train":
+        meta_X[catalog].to_parquet(
+            out / f"{split}_catalog.parquet",
+            compression='zstd',
+        )
     ## ----
 
     ## -- normalise laterality inplace ----
@@ -582,7 +605,8 @@ def main(split: str, out: Path):
                 planes[row.slot], lat_row
             )
         lat_counter[lat_row] += 1
-    X.flush()
+    if isinstance(X, np.memmap):
+        X.flush()
     logger.info(
         f"already left knee {lat_counter[1]} | laterality unresolved {lat_counter[None]} | converted right->left view {lat_counter[-1]}"
     )
@@ -590,10 +614,11 @@ def main(split: str, out: Path):
     # hence can be normalised only after all (StudyInstanceUID, SeriesInstanceUID) are processed.
     ## ----
 
+    if split != "train":
+        return X, meta_X[catalog]
+
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++
-
-
 
 
 # - When pushed as its own kernel, the script processes the training data

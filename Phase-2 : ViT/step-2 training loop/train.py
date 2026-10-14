@@ -3,14 +3,14 @@
 
 Inputs (outputs of prep_X.py / prep_y.py kernel run):
 *****************************************************
-train_X.npy -- [n_study, n_slot, n_slice, Height, Width]
-train_catalog.parquet -- (sl | StudyInstanceUID | slot | SeriesInstanceUID | file_name)
-train_y.parquet -- (StudyInstanceUID | <target> | <ref> | <weight> | <hard labels>)
+`train_X.npy` -- [n_study, n_slot, n_slice, Height, Width]
+`train_catalog.parquet` -- (sl | StudyInstanceUID | slot | SeriesInstanceUID | file_name)
+`train_y.parquet` -- (StudyInstanceUID | <target> | <ref> | <weight> | <hard labels>)
 
 Outputs:
 ********
-    model_ft_{A/B}.pt -- state_dict corresponding to the best epoch.
-    train.py -- copy of this script, which the final notebook can import.
+    `model_ft_{A/B}.pt` -- state_dict corresponding to the best epoch.
+    `train.py` -- copy of this script, which the final notebook can import.
 
 NOTE: The last few ViT blocks and the MLP head are trainable; all other layers are frozen.
 
@@ -27,9 +27,6 @@ from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from peft import LoraConfig, inject_adapter_in_model
-from peft.tuners.lora import LoraLayer
-import peft.tuners.lora.torchao as peft_torchao; peft_torchao.is_torchao_available = lambda: False # suppress unnecessary version conflicts in the Kaggle env.
 
 
 logger = logging.getLogger(__name__)
@@ -61,25 +58,24 @@ TIME_BUDGET = 8 * 3600.  # sufficient buffer (compared to the Kaggle session lim
 # ==================================================
 # Data
 # ====================================
-def load_split(prep_dir: Path, split: str) -> tuple:
+def load_state(X: np.ndarray, catalog: pd.DataFrame) -> tuple:
     """
     Load state from prep_X kernel runs.
+
+    - X --- [n_study, n_slot, N_SLICE, IMG, IMG]
+    - catalog --- (sl, StudyInstanceUID, slot, SeriesInstanceUID, file_name)
+    X and catalog have row-by-row correspondence.
     """
-    X = np.load(prep_dir / f"{split}_X.npy", mmap_mode="r")
-    catalog = pd.read_parquet(prep_dir / f"{split}_catalog.parquet").sort_values(["sl", "slot"]) 
-    # NOTE: X must be written in increasing order of (sl, slot).
-    mask = (
-        catalog.assign(ok=catalog["file_name"].notna())
-        .groupby(["StudyInstanceUID", "slot"], sort=False)["ok"].all()  
-        .unstack("slot", sort=False).astype(bool) 
+    n_study, n_slot = X.shape[:2]
+    mask = catalog["file_name"].notna().to_numpy().reshape(n_study, n_slot, -1).all(axis=-1)
+    # only slots with all slices successfully decoded are considered downstream.
+    mask_index = pd.Index(
+        catalog["StudyInstanceUID"].to_numpy().reshape(n_study, n_slot, -1)[:, 0, 0],
+        # each StudyInstanceUID spans a fixed block of n_slot * N_SLICE rows; 
+        # take the first row of each block.
+        name="StudyInstanceUID",
     )
-    assert mask.shape == X.shape[:2]
-    assert (mask.index == catalog["StudyInstanceUID"].unique()).all()  
-    assert (mask.columns == np.arange(X.shape[1])).all() 
-    # better to assert the index order, though trivial;
-    # otherwise, any change in pandas behaviour could silently produce
-    # incorrect downstream outputs.
-    return X, mask.to_numpy(bool), mask.index 
+    return X, mask, mask_index
  
 
 AUG_ROTATION_DEG = 8.0
@@ -120,8 +116,7 @@ def augment(imgs: torch.Tensor) -> torch.Tensor:
         theta, x.shape, 
         align_corners=False,
         # for a given (x_out, y_out),
-        # returns the source (x_in, y_in) =
-        #   (x_out*cos - y_out*sin + tx, x_out*sin + y_out*cos + ty).
+        # returns the source (x_in, y_in) = (x_out*cos - y_out*sin + tx, x_out*sin + y_out*cos + ty).
     )
     x = F.grid_sample(
         x, grid, 
@@ -136,6 +131,11 @@ def augment(imgs: torch.Tensor) -> torch.Tensor:
 # ==================================================
 # Model
 # ====================================
+
+from peft import LoraConfig, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
+import peft.tuners.lora.torchao as peft_torchao; peft_torchao.is_torchao_available = lambda: False 
+
 DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt"
 TUNE_BLOCKS = 4 
 LORA_RANK, LORA_ALPHA = 8, 16
@@ -143,7 +143,7 @@ LORA_TARGETS = ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"]
 ORTHO_ROPE = True 
 
 
-def build_ortho_model(n_slot: int) -> _Model:
+def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Model:
     """
     DINOv3 ViT-L/16 checkpoint
     ref: https://github.com/ytrsk/OrthoFoundation
@@ -167,7 +167,7 @@ def build_ortho_model(n_slot: int) -> _Model:
         # architecture only; no weight download.
     ) 
     checkpoint = torch.load(
-        ORTHO_WEIGHTS, 
+        checkpoint_path, 
         map_location="cpu", weights_only=True,
         # plain dict of tensors.
     )  
@@ -193,7 +193,6 @@ def build_ortho_model(n_slot: int) -> _Model:
     LoRA_config = LoraConfig(
         r=LORA_RANK, lora_alpha=LORA_ALPHA, 
         target_modules=LORA_TARGETS, bias="none",
-        lora_dropout=0.05,
         use_dora=True,
         # ref- https://arxiv.org/abs/2402.09353
     )
@@ -346,57 +345,81 @@ class _SlotHead(nn.Module):
 # ==================================================
 # Train / Predict
 # ==================================== 
-EVAL_BATCH = 8
+
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+
+def _prefetch[Key, Value](load: Callable[[Key], Value], keys: Iterable[Key]) -> Iterator[tuple[Key, Value]]:
+    """
+    (asynchronous prefetching)
+
+    Loads the next data chunk in a background thread while the main thread processes the current chunk.
+    In the long run, each step takes `max(load, compute)` runtime rather than `load + compute`.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = None
+        for key in keys:
+            current, pending = pending, (key, pool.submit(load, key))
+            if current is not None:
+                yield current[0], current[1].result()
+        if pending is not None:
+            yield pending[0], pending[1].result()
+
+
+EVAL_BATCH = 8 # x n_group rows per forward pass, as the groups are folded into the batch.
 
 @torch.no_grad()
 def predict(
         model, 
-        X: np.ndarray, mask: np.ndarray, 
+        X: np.ndarray, mask: np.ndarray | torch.Tensor, 
         idx: np.ndarray, 
         dev: torch.device,
+        restore_weights: bool = False,
     ) -> np.ndarray:
     """
     - X [n_study, n_slot, n_slice, Height, Width]
-    - mask [n_study, n_slots]
+    - mask [n_study, n_slots]; numpy is moved to `dev` once, a tensor already on `dev` is used as is.
 
     For any (StudyInstanceUID, slot), there can be multiple R-G-B stacks, 
     each contributing one prediction.
-    The final prediction is `Sigmoid(average logits)`.
+    The final prediction is the average logit (no sigmoid).
     """
     model.eval()
-    n_slice = X.shape[-3]
+    n_group = X.shape[-3] // RGB
+    H, W = X.shape[-2:]
+    mask = torch.as_tensor(mask, device=dev) 
     is_cuda = dev.type == "cuda"
     out = []
     lora_layers = [module for module in model.modules() if isinstance(module, LoraLayer)]
-    base_weights = [layer.base_layer.weight.detach().clone() for layer in lora_layers]
+    if restore_weights:
+        base_weights = [layer.base_layer.weight.detach().clone() for layer in lora_layers]
+
     for layer in lora_layers:
         layer.merge()
         # fold LoRA into the base weight once,
         # instead of recomputing ||W + BA|| on every eval forward pass for `len(idx)`.
 
-    for b in range(0, len(idx), EVAL_BATCH): # [[MAIN]]
-        uid = idx[b:b + EVAL_BATCH]
-        m = torch.from_numpy(mask[uid]).to(dev)
-        logits = []
-        for g in range(0, n_slice, RGB):
-            X_g = torch.from_numpy(
-                np.ascontiguousarray(X[uid, :, g:g + RGB])
-            ).to(dev)
-            with torch.autocast("cuda", enabled=is_cuda):
-                logits.append(model(X_g, m).float())
-        out.append(torch.stack(logits, dim=-1))  
+    batches = [idx[b:b + EVAL_BATCH] for b in range(0, len(idx), EVAL_BATCH)]
+    for uid, X_batch in _prefetch(lambda uid: X[uid], batches): # [[MAIN]]
+        X_batch = torch.tensor(X_batch, device=dev) 
+        B, S = X_batch.shape[:2]
+        # fold groups into the batch: [B, S, n_group * RGB, H, W] --> [B * n_group, S, RGB, H, W]
+        X_batch = X_batch.reshape(B, S, n_group, RGB, H, W).transpose(1, 2).reshape(B * n_group, S, RGB, H, W)
+        m = mask[torch.tensor(uid, device=dev)].repeat_interleave(n_group, dim=0) 
+        with torch.autocast("cuda", enabled=is_cuda):
+            logits = model(X_batch, m).float()
 
-    for layer, base_weight in zip(lora_layers, base_weights):
-        layer.unmerge()
-        # restore the exact frozen weights before resuming training;
-        # `unmerge` alone may introduce round-off errors.
-        layer.base_layer.weight.data.copy_(base_weight)
+        # [B * n_group, n_out] --> [B, n_group, n_out] --mean over groups--> [B, n_out] logits.
+        out.append(logits.reshape(B, n_group, -1).mean(dim=1))
 
-    ## [len(idx), n_out, n_group] --mean over groups--> 
-    ##      [len(idx), n_out] --sigmoid (element-wise)--> probabilities.
-    if not out:
-        return np.zeros((0, len(TARGETS)), np.float32)
-    return torch.cat(out).mean(dim=-1).sigmoid().cpu().numpy()
+    if restore_weights: # [[needed when training resumes]]
+        for layer, base_weight in zip(lora_layers, base_weights):
+            layer.unmerge()
+            # restore the exact frozen weights before resuming training;
+            # `unmerge` alone may introduce round-off errors.
+            layer.base_layer.weight.data.copy_(base_weight)
+
+    return torch.cat(out).cpu().numpy() if out else np.zeros((0, len(TARGETS)), np.float32) # append batches together.
  
 
 EPOCHS = 10
@@ -417,7 +440,10 @@ def train_run(rank: int):
     run_name = chr(rank + 65)
     # name [0, 1, ...] ---> [A, B, ...]
     train_folds = RUNS[run_name]
-    
+    np.random.seed(SEED + rank)
+    torch.manual_seed(SEED + rank)
+    # ensemble diversity: A/B differ in initialization, augmentation, and batch order.
+
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [{run_name}] %(message)s",
@@ -425,13 +451,19 @@ def train_run(rank: int):
         force=True,
     )
     T0 = time.time()
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
- 
-    X, mask, mask_index = load_split(PREP_X_OUT, "train") # the raw pixel array and metadata.
+    has_cuda = True
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    ## -- image data ----
+    X, mask, mask_index = load_state(
+        X = np.load(PREP_X_OUT / "train_X.npy", mmap_mode="r"),
+        catalog = pd.read_parquet(PREP_X_OUT / "train_catalog.parquet"),
+    ) # the raw pixel array and metadata.
     n_group = X.shape[-3] // RGB 
-    N = len(X)
+    N, S = X.shape[:2]
     logger.info(f"X {X.shape}; slots filled {int(mask.sum(axis=None))}/{mask.size}")
+    ## ----
  
     ## -- targets ----
     target = pd.read_parquet(PREP_Y_OUT / "train_y.parquet").reindex(mask_index)
@@ -443,9 +475,14 @@ def train_run(rank: int):
 
     skip = ~ W.any(axis=1) # skip studies with all-zero weights; they do not contribute to training.
     logger.info(f"supervised {(~skip).sum()} of {N} studies")
+
+    Y_device, W_device = torch.tensor(Y, device=device), torch.tensor(W, device=device)
+    mask_device = torch.tensor(mask, device=device)
+    # move Y, W, mask from CPU to GPU once (< 1 MB).
+    # X is huge (10 GB+) and stays on disk; move to GPU chunk-wise as needed.
     ## ----
 
-    ## -- train/validation 80/20 splits ----
+    ## -- train/validation 60/40 splits ----
     report = pd.read_csv(
         DATA_ROOT / "train.csv",
         usecols=["StudyInstanceUID", "Report"], dtype="string",
@@ -480,11 +517,23 @@ def train_run(rank: int):
     ## ----
 
     ## -- fine-tuning ----
-    has_cuda = True
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
     scaler = torch.amp.GradScaler("cuda", enabled=has_cuda)
-    model = build_ortho_model(n_slot=X.shape[1]).to(device)
+    model = build_ortho_model(n_slot=S).to(device)
+    lora_base_layers = {module.base_layer for module in model.modules() if isinstance(module, LoraLayer)}
+    for module in model.modules():
+        if (
+            isinstance(module, nn.Linear)
+            and not any(param.requires_grad for param in module.parameters())
+            and module not in lora_base_layers 
+        ):
+            # `autocast(...)` makes a temporary fp32 --> fp16 copy of Linear weights on every forward pass;
+            # for frozen modules, we make this half-cast once
+            # and avoid that overhead in n_epochs * (n_batches_train + n_group * n_batches_predict) forward passes.
+            module.half()
+    for block in model.backbone.blocks:
+        # forward pass is dominated by matmuls;
+        # compile the blocks for faster training epochs.
+        block.compile(dynamic=True) 
     trainable = {name for name, param in model.named_parameters() if param.requires_grad}
     opt = torch.optim.AdamW(
         [
@@ -500,33 +549,39 @@ def train_run(rank: int):
     )
     
     best, best_state = -1.0, None
- 
+
+    def read_train_batch(key):
+        batch, g_id = key
+        return X[batch, :, g_id * RGB:(g_id + 1) * RGB]
+
     for epoch in range(EPOCHS): # [[MAIN]]
         model.train()
         current_permutation = np.random.permutation(train_set)
-        tot, nstep = 0.0, 0
-        for b_start in range(0, n_train - BATCH_STUDIES + 1, BATCH_STUDIES):
-            batch = np.sort(current_permutation[b_start:b_start + BATCH_STUDIES])
-            g_id = np.random.randint(n_group) 
+        batches = [
+            (
+                np.sort(current_permutation[b_start:b_start + BATCH_STUDIES]), 
+                np.random.randint(n_group)
+            )
+            for b_start in range(0, n_train - BATCH_STUDIES + 1, BATCH_STUDIES)
             # each (study, slot) contains multiple slices as R-G-B stacks:
             #   [l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1]
             #      <group-l>    <group-m>     <group-h>
             # for each batch in the training loop, we randomly pick only one group.
-            imgs = augment(
-                torch.from_numpy(
-                    np.ascontiguousarray(X[batch, :, g_id * RGB:(g_id + 1) * RGB])
-                ).to(device)
-            )
-            m = torch.from_numpy(mask[batch]).to(device)
-            y = torch.from_numpy(Y[batch]).to(device)
-            w = torch.from_numpy(W[batch]).to(device)
+        ]
+        tot, nstep = 0.0, 0
+        for (batch, _), X_batch in _prefetch(read_train_batch, batches):
+            imgs = augment(torch.tensor(X_batch, device=device))
+            batch_device = torch.tensor(batch, device=device)
+            m, y, w = mask_device[batch_device], Y_device[batch_device], W_device[batch_device]
             with torch.autocast("cuda", enabled=has_cuda):
                 loss = (
-                    # weighted BCE loss on soft-labels.
                     F.binary_cross_entropy_with_logits(
                         model(imgs, m), y, 
                         reduction="none",
                     ) * w
+                    # weighted BCE loss on soft labels.
+                    # equivalent to `BCEWithLogitsLoss(...)`,
+                    # but each sample has different weight vectors.
                 ).mean()
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -536,7 +591,7 @@ def train_run(rank: int):
             tot += loss.item()
             nstep += 1
  
-        holdout_pred = predict(model, X, mask, validation_set, device)
+        holdout_pred = predict(model, X, mask_device, validation_set, device, restore_weights=True)
         holdout_label_auc = roc_auc_score(val_labels, holdout_pred, average=None) 
         holdout_auc = np.nanmean(holdout_label_auc)
         holdout_ref_auc = np.nanmean(roc_auc_score(val_ref_labels, holdout_pred[is_val_ref], average=None)) if n_val_ref else np.nan

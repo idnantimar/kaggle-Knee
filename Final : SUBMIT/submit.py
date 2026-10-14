@@ -1,7 +1,7 @@
 """
 SUBMISSION: 
 ***********
-    test_series --prep_X--> test_X.npy --->
+    test_series --prep_X--> (X, catalog) --->
 
         [DINOv3 ViT-L/16 checkpoint
         ref: https://github.com/ytrsk/OrthoFoundation
@@ -35,7 +35,7 @@ TRAIN_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-train"
 
 sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT)] # prioritize over any other module with the same name.
 import prep_X
-from train import TARGETS, build_ortho_model, load_split, predict
+from train import TARGETS, build_ortho_model, load_state, predict
 
 logger = logging.getLogger(__name__)
 SUBMIT_RUNS = ['A', 'B'] 
@@ -43,11 +43,8 @@ N_SUBMIT = len(SUBMIT_RUNS)
 
 
 def main() -> pd.DataFrame:
-    ## -- test_X.npy + test_catalog.parquet saved to WORKING ----
-    prep_X.main("test", WORKING) 
-    ## ----
-    ## -- load state from the prep_X run ---- 
-    X, mask, mask_index = load_split(WORKING, "test")
+    ## -- X + catalog ----
+    X, mask, mask_index = load_state(*prep_X.main("test"))
     N, S = X.shape[:2]
     ## ----
 
@@ -78,7 +75,7 @@ def main() -> pd.DataFrame:
         run_preds = pool.map(predict_run, SUBMIT_RUNS, devices)
     ## ---- 
 
-    ## -- rank ensemble --
+    ## -- rank ensemble ----
     out = np.mean(
         [
             rankdata(run_pred, axis=0) 
@@ -96,5 +93,11 @@ def main() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="[%(relativeCreated)8.0fms] %(message)s", force=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    
     main().to_csv(WORKING / "submission.csv")
