@@ -12,13 +12,13 @@ Outputs:
     `model_ft_{A/B}.pt` -- state_dict corresponding to the best epoch.
     `train.py` -- copy of this script, which the final notebook can import.
 
-NOTE: The last few ViT blocks and the MLP head are trainable; all other layers are frozen.
-
 """
 
 from __future__ import annotations
 
 import gc, hashlib, logging, shutil, time, os
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 import numpy as np, pandas as pd
@@ -36,8 +36,9 @@ INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
 DATA_ROOT = INPUT / "competitions/rsna-knee-abnormality-detection"
 PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
-ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation"
- 
+
+ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation" # +3 percentage points over generic DINOv3 ViT-L/16.
+DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt" 
  
 TARGETS = [
     "ACL", "MCL",
@@ -136,11 +137,15 @@ from peft import LoraConfig, inject_adapter_in_model
 from peft.tuners.lora import LoraLayer
 import peft.tuners.lora.torchao as peft_torchao; peft_torchao.is_torchao_available = lambda: False 
 
-DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt"
-TUNE_BLOCKS = 4 
-LORA_RANK, LORA_ALPHA = 8, 16
-LORA_TARGETS = ["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"]
-ORTHO_ROPE = True 
+LORA_RANK = 8
+def _LoRA(layers: list):
+    # ref- https://arxiv.org/abs/2402.09353
+    return LoraConfig(
+        r=LORA_RANK, lora_alpha=LORA_RANK * 2, 
+        target_modules=layers, bias="none",
+        lora_dropout=0.1,
+        use_dora=True,
+    )
 
 
 def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Model:
@@ -148,9 +153,8 @@ def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Mo
     DINOv3 ViT-L/16 checkpoint
     ref: https://github.com/ytrsk/OrthoFoundation
     (with continued pretraining on 1.2M knee images)
-        ├── early blocks       <frozen>
-        ├── ...
-        ├── last TUNE_BLOCKS   <trainable DoRA adapters>
+        ├── patch embedding    <trainable DoRA adapter>
+        ├── all 24 blocks      <trainable DoRA adapters>
         └── final norm         <trainable>
 
         +
@@ -186,33 +190,32 @@ def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Mo
         # STRICT:
         # the checkpoint tensors must match the ViT-L/16 architecture exactly by name and shape.
     )  
-    for param in ViT.parameters():
-        param.requires_grad = False
-    n_blocks = len(ViT.blocks)
-    n_tune = min(n_blocks, TUNE_BLOCKS)
-    LoRA_config = LoraConfig(
-        r=LORA_RANK, lora_alpha=LORA_ALPHA, 
-        target_modules=LORA_TARGETS, bias="none",
-        use_dora=True,
-        # ref- https://arxiv.org/abs/2402.09353
+    ViT.requires_grad_(False)
+    ViT.norm.requires_grad_(True)
+    # base weights and bias are frozen;
+    # final norm is trainable.
+
+    inject_adapter_in_model(
+        _LoRA(["proj"]), ViT.patch_embed,
+        # we use 3 adjacent grayscale MRI slices as a pseudo-RGB stack,
+        # hence tune the patch embeddings to adapt from usual RGB image behaviour.
     )
-    for block in ViT.blocks[n_blocks - n_tune:]:
+    LoRA_config = _LoRA(["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"])
+    for block in ViT.blocks:
         with torch.no_grad():
             block.attn.qkv.bias.mul_(block.attn.qkv.bias_mask)
-            # DINOv3 uses shared QKV and masks K-bias during the forward pass,
+            # DINOv3 uses shared QKV and masks K-bias on-the-fly during the forward pass,
             # but PEFT DoRA uses the stored, unmasked bias during weight recomputation;
             # apply the mask in place before injecting DoRA so both agree.
-            # (the forward output remains unchanged).
+            # (the forward output remains unchanged)
         inject_adapter_in_model(LoRA_config, block)
-    for param in ViT.norm.parameters():
-        param.requires_grad = True
-    ViT.eval()
 
+    ViT.eval()
     n_ft = sum(p.numel() for p in ViT.parameters() if p.requires_grad) / 1e6
     logger.info(
         f"""
-        backbone: OrthoFoundation-L, {n_blocks} blocks,
-        DoRA (rank {LORA_RANK}) on last {n_tune} ({n_ft:.2f}M trainable params), rope={ORTHO_ROPE}
+        backbone: OrthoFoundation-L,
+        DoRA (rank {LORA_RANK}) on patch embedding + all {len(ViT.blocks)} blocks ({n_ft:.2f}M trainable params)
         """
     )
     return _Model(ViT, ViT.embed_dim, n_slot)
@@ -242,6 +245,8 @@ class _Model(nn.Module):
         x = (imgs.reshape(B * S, *imgs.shape[2:])[filled].float() / 255. - self.mean) / self.std
         cls, patch = self.emb(x) 
         # only filled slots (~81%) are passed through the backbone.
+        # NOTE: missing slots do not contribute to the final prediction,
+        # hence skip the expensive matmuls for them.
         features = torch.cat([cls, patch.mean(dim=1)], dim=1)
         slot_features = features.new_zeros(B * S, features.shape[1])
         slot_features[filled] = features
@@ -250,19 +255,14 @@ class _Model(nn.Module):
     def emb(self, x: torch.Tensor) -> tuple:
         """
         The encoder pass of scaled inputs [batch_len * n_slots, R-G-B, Height, Width] happens here.
-        The initial blocks stay frozen; only the last few ViT blocks are fine-tuned.
         Extracts:
             CLS [batch_len * n_slots, dim],
             mean(patches [batch_len * n_slots, n_patch, dim])
         """
         ViT = self.backbone
-        k0 = max(len(ViT.blocks) - TUNE_BLOCKS, 0)
-        with torch.no_grad(): ## [[frozen blocks: 0, 1, ..., k0-1]]
-            t, (H, W) = ViT.prepare_tokens_with_masks(x)
-            rope = ViT.rope_embed(H=H, W=W) if (ORTHO_ROPE and ViT.rope_embed is not None) else None
-            for block in ViT.blocks[:k0]:
-                t = block(t, rope)
-        for block in ViT.blocks[k0:]: ## [[fine-tuned layers: k0, k0+1, ...]]
+        t, (H, W) = ViT.prepare_tokens_with_masks(x)
+        rope = ViT.rope_embed(H=H, W=W) if (ViT.rope_embed is not None) else None
+        for block in ViT.blocks:
             t = block(t, rope)
         t = ViT.norm(t)
         # [batch_len * n_slots, CLS | storage tokens | patch tokens, dim] embeddings.
@@ -270,11 +270,14 @@ class _Model(nn.Module):
  
     def train(self, mode=True):
         """
-        - backbone always in `eval` mode (no dropout / stochastic depth).
+        - backbone always in `eval` mode (no dropout / stochastic depth),
+          except DoRA dropout, which follows `mode`.
         - head in `train` mode if mode=True.
         """
         super().train(mode)
-        self.backbone.eval()  
+        for name, module in self.backbone.named_modules():
+            if not (isinstance(module, LoraLayer) or ".lora_dropout." in name):
+                module.training = False
         return self
 
 class _SlotHead(nn.Module):
@@ -299,9 +302,11 @@ class _SlotHead(nn.Module):
         ):
         super().__init__()
         self.proj = nn.Sequential(
-            nn.LayerNorm(dim), 
-            nn.Linear(dim, hidden), 
-            nn.GELU(),
+            OrderedDict(
+                norm=nn.LayerNorm(dim), 
+                linear=nn.Linear(dim, hidden), 
+                activation=nn.GELU(),
+            )
             # for each (StudyInstanceUID, slot):
             #   ViT embedding --normalized--> hidden layer --activation--> .
         )
@@ -330,7 +335,7 @@ class _SlotHead(nn.Module):
             ) / (self.hidden ** 0.5)
         ).masked_fill(~mask, -1e4).softmax(dim=-1)
         # - `softmax` ensures w sums to 1 across slots.
-        # - `masked_fill` ensures w=0 for empty slot placeholders.
+        # - `masked_fill` ensures approximately w=0 for empty-slot placeholders.
         wx = torch.einsum(
             "bos,bsh->boh", w, x_,
             # label-wise weighted average of slot embeddings.
@@ -346,7 +351,6 @@ class _SlotHead(nn.Module):
 # Train / Predict
 # ==================================== 
 
-from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 def _prefetch[Key, Value](load: Callable[[Key], Value], keys: Iterable[Key]) -> Iterator[tuple[Key, Value]]:
@@ -356,18 +360,21 @@ def _prefetch[Key, Value](load: Callable[[Key], Value], keys: Iterable[Key]) -> 
     Loads the next data chunk in a background thread while the main thread processes the current chunk.
     In the long run, each step takes `max(load, compute)` runtime rather than `load + compute`.
     """
+    keys = iter(keys)
+    try:
+        key = next(keys)
+    except StopIteration:
+        return
     with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = None
-        for key in keys:
-            current, pending = pending, (key, pool.submit(load, key))
-            if current is not None:
-                yield current[0], current[1].result()
-        if pending is not None:
-            yield pending[0], pending[1].result()
+        future = pool.submit(load, key) # <first key>.
+        for next_key in keys:
+            next_future = pool.submit(load, next_key)
+            yield key, future.result()
+            key, future = next_key, next_future
+        yield key, future.result() # <last key>.
 
 
-EVAL_BATCH = 8 # x n_group rows per forward pass, as the groups are folded into the batch.
-
+EVAL_BATCH = 8 
 @torch.no_grad()
 def predict(
         model, 
@@ -397,7 +404,7 @@ def predict(
     for layer in lora_layers:
         layer.merge()
         # fold LoRA into the base weight once,
-        # instead of recomputing ||W + BA|| on every eval forward pass for `len(idx)`.
+        # instead of recomputing `W + BA` on every eval forward pass for `len(idx) / EVAL_BATCH`.
 
     batches = [idx[b:b + EVAL_BATCH] for b in range(0, len(idx), EVAL_BATCH)]
     for uid, X_batch in _prefetch(lambda uid: X[uid], batches): # [[MAIN]]
@@ -423,8 +430,9 @@ def predict(
  
 
 EPOCHS = 10
-BATCH_STUDIES = 8
-LR_HEAD, LR_BACKBONE = 1e-3, 2e-4
+BATCH_STUDIES, ACCUMULATION_STEPS = 4, 2 
+GRADIENT_CLIP_NORM = 1.0
+LR_HEAD, LR_BACKBONE, LR_PATCH_EMBED = 1e-3, 2e-4, 4e-5
 RUNS = {
     "A": (0, 1, 2), 
     "B": (2, 3, 4),
@@ -519,60 +527,97 @@ def train_run(rank: int):
     ## -- fine-tuning ----
     scaler = torch.amp.GradScaler("cuda", enabled=has_cuda)
     model = build_ortho_model(n_slot=S).to(device)
-    lora_base_layers = {module.base_layer for module in model.modules() if isinstance(module, LoraLayer)}
-    for module in model.modules():
-        if (
-            isinstance(module, nn.Linear)
-            and not any(param.requires_grad for param in module.parameters())
-            and module not in lora_base_layers 
-        ):
-            # `autocast(...)` makes a temporary fp32 --> fp16 copy of Linear weights on every forward pass;
-            # for frozen modules, we make this half-cast once
-            # and avoid that overhead in n_epochs * (n_batches_train + n_group * n_batches_predict) forward passes.
-            module.half()
+
+    batch_head = np.arange(
+        0, n_train - BATCH_STUDIES + 1, 
+        BATCH_STUDIES,
+    ) # first element in a batch.
+    n_batches = len(batch_head) - len(batch_head) % ACCUMULATION_STEPS
+    batch_head = batch_head[:n_batches]
+    # make the number of batches a multiple of ACCUMULATION_STEPS.
+    #
+    # due to GPU memory constraints, we need a small BATCH_STUDIES
+    # and use ACCUMULATION_STEPS to avoid noisy gradients;
+    # the effective batch size becomes BATCH_STUDIES * ACCUMULATION_STEPS per gradient-descent update.
+    accumulation_start_id, accumulation_end_id = 0, ACCUMULATION_STEPS - 1
+    n_updates = n_batches // ACCUMULATION_STEPS
+    assert n_updates > 0, "`n_updates` must be > 0; otherwise, `batch_head` is [] and no training occurs."
+
     for block in model.backbone.blocks:
         # forward pass is dominated by matmuls;
         # compile the blocks for faster training epochs.
         block.compile(dynamic=True) 
     trainable = {name for name, param in model.named_parameters() if param.requires_grad}
-    opt = torch.optim.AdamW(
-        [
-            {"params": model.head.parameters(), "lr": LR_HEAD},
-            {"params": [param for param in model.backbone.parameters() if param.requires_grad], "lr": LR_BACKBONE},
-        ], weight_decay=0.02,
-    )
+    MLP_head, ViT = model.head, model.backbone
+    block_DoRA = [module for module in ViT.blocks.modules() if isinstance(module, LoraLayer)]
+    patch_DoRA = ViT.patch_embed.proj
+    opt = torch.optim.AdamW([
+        {
+            "params": [MLP_head.slot_emb, MLP_head.query, MLP_head.proj.linear.weight, MLP_head.out.weight],
+            "lr": LR_HEAD, "weight_decay": 0.02,
+        },
+        {
+            "params": [MLP_head.proj.norm.weight, MLP_head.proj.norm.bias, MLP_head.proj.linear.bias, MLP_head.out.bias],
+            "lr": LR_HEAD, "weight_decay": 0.0,
+        },
+        {
+            "params": [layer.lora_A["default"].weight for layer in block_DoRA] + [layer.lora_B["default"].weight for layer in block_DoRA],
+            "lr": LR_BACKBONE, "weight_decay": 0.02,
+        },
+        {
+            "params": [layer.lora_magnitude_vector["default"].weight for layer in block_DoRA] + [ViT.norm.weight, ViT.norm.bias],
+            "lr": LR_BACKBONE, "weight_decay": 0.0,
+        },
+        {
+            "params": [patch_DoRA.lora_A["default"].weight, patch_DoRA.lora_B["default"].weight],
+            "lr": LR_PATCH_EMBED, "weight_decay": 0.02,
+        },
+        {
+            "params": [patch_DoRA.lora_magnitude_vector["default"].weight],
+            "lr": LR_PATCH_EMBED, "weight_decay": 0.0,
+        },
+    ]) # no weight decay on Linear-layer biases, LayerNorm affine parameters, and DoRA magnitude vectors.
+    assert (
+        sorted(id(param) for group in opt.param_groups for param in group["params"]) 
+        == sorted(id(param) for param in model.parameters() if param.requires_grad)
+    ), "optimizer groups must contain every trainable parameter exactly once (and nothing frozen)."
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=[LR_HEAD, LR_BACKBONE],
+        opt, max_lr=[group["lr"] for group in opt.param_groups],
         epochs=EPOCHS,
-        steps_per_epoch=max(n_train // BATCH_STUDIES, 1), 
-        pct_start=0.15,
+        steps_per_epoch=n_updates, 
+        pct_start=0.15, anneal_strategy='cos',
+        # cosine learning-rate scheduler.
     )
-    
-    best, best_state = -1.0, None
 
-    def read_train_batch(key):
+    def _read_train_batch(key):
         batch, g_id = key
         return X[batch, :, g_id * RGB:(g_id + 1) * RGB]
 
+    best, best_state = -1.0, None
     for epoch in range(EPOCHS): # [[MAIN]]
         model.train()
         current_permutation = np.random.permutation(train_set)
         batches = [
             (
-                np.sort(current_permutation[b_start:b_start + BATCH_STUDIES]), 
+                np.sort(current_permutation[b:b + BATCH_STUDIES]), 
                 np.random.randint(n_group)
             )
-            for b_start in range(0, n_train - BATCH_STUDIES + 1, BATCH_STUDIES)
+            for b in batch_head
             # each (study, slot) contains multiple slices as R-G-B stacks:
             #   [l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1]
             #      <group-l>    <group-m>     <group-h>
             # for each batch in the training loop, we randomly pick only one group.
-        ]
+        ] 
+        
         tot, nstep = 0.0, 0
-        for (batch, _), X_batch in _prefetch(read_train_batch, batches):
+        for (batch, _), X_batch in _prefetch(_read_train_batch, batches):
             imgs = augment(torch.tensor(X_batch, device=device))
             batch_device = torch.tensor(batch, device=device)
             m, y, w = mask_device[batch_device], Y_device[batch_device], W_device[batch_device]
+
+            if nstep % ACCUMULATION_STEPS == accumulation_start_id:
+                opt.zero_grad(set_to_none=True)
+
             with torch.autocast("cuda", enabled=has_cuda):
                 loss = (
                     F.binary_cross_entropy_with_logits(
@@ -582,28 +627,40 @@ def train_run(rank: int):
                     # weighted BCE loss on soft labels.
                     # equivalent to `BCEWithLogitsLoss(...)`,
                     # but each sample has different weight vectors.
-                ).mean()
-            opt.zero_grad(set_to_none=True)
+                ).mean() / ACCUMULATION_STEPS
+                # mean loss of the effective batch.
             scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            scheduler.step()
             tot += loss.item()
+
+            if nstep % ACCUMULATION_STEPS == accumulation_end_id:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    [param for group in opt.param_groups for param in group["params"]], 
+                    GRADIENT_CLIP_NORM,
+                )
+                scaler.step(opt)
+                scaler.update()
+                scheduler.step()
+
             nstep += 1
  
-        holdout_pred = predict(model, X, mask_device, validation_set, device, restore_weights=True)
+        holdout_pred = predict(
+            model, 
+            X, mask_device, validation_set, 
+            device, restore_weights=True,
+        )
         holdout_label_auc = roc_auc_score(val_labels, holdout_pred, average=None) 
         holdout_auc = np.nanmean(holdout_label_auc)
         holdout_ref_auc = np.nanmean(roc_auc_score(val_ref_labels, holdout_pred[is_val_ref], average=None)) if n_val_ref else np.nan
         label_auc_text = "; ".join(f"{target} {auc:.4f}" for target, auc in zip(TARGETS, holdout_label_auc))
         logger.info(
             f"""
-            EPOCH {epoch + 1}/{EPOCHS} | loss {tot / max(nstep, 1):.4f} | holdout macro auc {holdout_auc:.4f} | annotated studies (n={n_val_ref}) macro auc {holdout_ref_auc:.4f}
+            EPOCH {epoch + 1}/{EPOCHS} | loss {tot / n_updates:.4f} | holdout macro auc {holdout_auc:.4f} | annotated studies (n={n_val_ref}) macro auc {holdout_ref_auc:.4f}
             holdout auc per label: {label_auc_text}"""
         )
                 
         # best epoch is chosen based on full holdout AUC;
-        # the annotated reference studies (~ 1.3% * 1/5) are too few to make a decision.
+        # the annotated reference studies (~ 1.3% * 2/5) are too few to make a decision.
         if holdout_auc > best:
             best = holdout_auc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items() if k in trainable}

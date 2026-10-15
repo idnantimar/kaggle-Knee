@@ -6,10 +6,9 @@ SUBMISSION:
         [DINOv3 ViT-L/16 checkpoint
         ref: https://github.com/ytrsk/OrthoFoundation
         (continued pretraining on 1.2M knee images)
-            ├── early blocks       <frozen>
-            ├── ...
-            ├── last TUNE_BLOCKS   <DoRA fine-tuned>
-            └── final norm         <fine-tuned>
+        ├── patch embedding    <LoRA fine-tuned>
+        ├── all 24 blocks      <LoRA fine-tuned>
+        └── final norm         <fine-tuned>
         +
         SlotHead (learned attention pooling)]<ensemble model_ft_{A/B}.pt>
 
@@ -33,7 +32,8 @@ WORKING = Path("/kaggle/working/")
 PREP_X_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x-out"  
 TRAIN_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-train"  
 
-sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT)] # prioritize over any other module with the same name.
+sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT)] 
+# prioritize over any other module with the same name.
 import prep_X
 from train import TARGETS, build_ortho_model, load_state, predict
 
