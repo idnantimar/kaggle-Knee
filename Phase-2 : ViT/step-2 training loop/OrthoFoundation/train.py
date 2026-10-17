@@ -35,7 +35,7 @@ SEED = 2026
 INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
 DATA_ROOT = INPUT / "competitions/rsna-knee-abnormality-detection"
-PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
+PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x5gr-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
 
 ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation" # +3 percentage points over generic DINOv3 ViT-L/16.
 DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt" 
@@ -429,7 +429,7 @@ def predict(
     return torch.cat(out).cpu().numpy() if out else np.zeros((0, len(TARGETS)), np.float32) # append batches together.
  
 
-EPOCHS = 10
+EPOCHS = 25
 BATCH_STUDIES, ACCUMULATION_STEPS = 4, 2 
 GRADIENT_CLIP_NORM = 1.0
 LR_HEAD, LR_BACKBONE, LR_PATCH_EMBED = 1e-3, 2e-4, 4e-5
@@ -604,8 +604,8 @@ def train_run(rank: int):
             )
             for b in batch_head
             # each (study, slot) contains multiple slices as R-G-B stacks:
-            #   [l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1]
-            #      <group-l>    <group-m>     <group-h>
+            #   [x_l-1, x_l, x_l+1 | l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1 | x_h-1, x_h, x_h+1]
+            #   <group-extreme_low>  <group-low> <group-medium> <group-high> <group-extreme_high>
             # for each batch in the training loop, we randomly pick only one group.
         ] 
         

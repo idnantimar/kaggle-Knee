@@ -29,8 +29,8 @@ from scipy.stats import rankdata
 
 INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
-PREP_X_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x-out"  
-TRAIN_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-train"  
+PREP_X_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x5gr-out"  
+TRAIN_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-train-ortho"  
 
 sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT)] 
 # prioritize over any other module with the same name.

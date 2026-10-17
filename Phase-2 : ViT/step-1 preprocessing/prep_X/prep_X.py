@@ -54,11 +54,11 @@ JOB_i = Annotated[
 
 # MRI slices are grayscale, while ViT expects R-G-B channels per input image;
 # we stack 3 adjacent MRI slices as a single encoder pass.
-N_GROUP_MAX = 3 # number of [R|G|B]-like stacks per (StudyInstanceUID, SeriesInstanceUID)
+N_GROUP_MAX = 5 # number of [R|G|B]-like stacks per (StudyInstanceUID, SeriesInstanceUID)
 N_SLICE = 3 * N_GROUP_MAX
 # Total number of slices used per (StudyInstanceUID, SeriesInstanceUID): 3 * N_GROUP_MAX
-SLICE_BAND = (0.2, 0.8) 
-# only the middle 20–80% of each ordered slice stack is sampled per (StudyInstanceUID, SeriesInstanceUID);
+SLICE_BAND = (0.15, 0.85) 
+# only the middle 15–85% of each ordered slice stack is sampled per (StudyInstanceUID, SeriesInstanceUID);
 # edge slices are assumed to contain mostly background noise.
 MID_SLICE_IDX = N_SLICE // 2 # single-slice representative of a (StudyInstanceUID, SeriesInstanceUID)
 
@@ -395,7 +395,7 @@ def read_Series(job_row: JOB_i) -> tuple[BUFFER | None, list[dict]]:
     lo, hi = np.floor(SLICE_BAND[0] * n_1), np.ceil(SLICE_BAND[1] * n_1)
     centres = np.linspace(lo, hi, N_GROUP_MAX).round()
     idx = np.clip((centres[:, None] + np.array([-1, 0, 1])), 0, n_1).astype(int).ravel()
-    # l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1
+    # x_l-1, x_l, x_l+1 | l-1, l, l+1 | m-1, m, m+1 | h-1, h, h+1 | x_h-1, x_h, x_h+1
  
     # only store successfully decoded slices
     decoded = {

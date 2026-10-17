@@ -1,7 +1,7 @@
 {
-  "id": "ramitnandi/rsna-knee-submit-ab",
-  "title": "rsna-knee-submit-ab",
-  "code_file": "submit.py",
+  "id": "ramitnandi/rsna-knee-train-ortho",
+  "title": "rsna-knee-train-ortho",
+  "code_file": "train.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": "true",
@@ -10,14 +10,13 @@
   "enable_internet": "false",
   "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
-    "ramitnandi/rsna-knee-prep-x-out"
+    "ramitnandi/rsna-knee-prep-x5gr-out",
+    "ramitnandi/rsna-knee-prep-y-out"
   ],
   "competition_sources": [
     "rsna-knee-abnormality-detection"
   ],
-  "kernel_sources": [
-    "ramitnandi/rsna-knee-train"
-  ],
+  "kernel_sources": [],
   "model_sources": [
     "ramitnandi/orthofoundation/pytorch/default/1"
   ]
