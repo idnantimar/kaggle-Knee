@@ -1,0 +1,23 @@
+{
+  "id": "ramitnandi/rsna-knee-train-dino",
+  "title": "rsna-knee-train-dino",
+  "code_file": "train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "ramitnandi/rsna-knee-prep-x5gr-out",
+    "ramitnandi/rsna-knee-prep-y-out"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [],
+  "model_sources": [
+    "ramitnandi/dinov3-vit/pytorch/default/1"
+  ]
+}

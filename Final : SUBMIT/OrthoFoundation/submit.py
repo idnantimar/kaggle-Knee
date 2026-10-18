@@ -20,6 +20,7 @@ NOTE: This script assumes each input returns a non-null prediction (validated up
 
 import logging, sys
 from concurrent.futures import ThreadPoolExecutor
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -68,11 +69,22 @@ def main() -> pd.DataFrame:
         logger.info(f"run {run_name}: predicted {N} studies on {dev}")
         return run_pred
 
-    ## -- (T4 x2: A on cuda:0, B on cuda:1) ----
+    ## -- (T4 x2: cuda:0 -> A | cuda:1 -> B; one model per GPU at a time) ----
     n_gpu = torch.cuda.device_count()
-    devices = [torch.device(f"cuda:{i % n_gpu}") if n_gpu else torch.device("cpu") for i in range(N_SUBMIT)] 
-    with ThreadPoolExecutor(max_workers=min(n_gpu or 1, N_SUBMIT)) as pool:
-        run_preds = pool.map(predict_run, SUBMIT_RUNS, devices)
+    devices = [torch.device(f"cuda:{i}") for i in range(n_gpu)] if n_gpu else [torch.device("cpu")]
+    n_dev = len(devices)
+
+    def predict_runs_on_device(device_index: int) -> list[np.ndarray]:
+        return [
+            predict_run(SUBMIT_RUNS[run_index], devices[device_index]) 
+            for run_index in range(device_index, N_SUBMIT, n_dev)
+        ]
+
+    with ThreadPoolExecutor(max_workers=n_dev) as pool:
+        run_preds = chain.from_iterable(
+            pool.map(predict_runs_on_device, range(n_dev))
+            # [[dev1_run1],[dev2_run1]] --> [dev1_run1,dev2_run1];
+        )
     ## ---- 
 
     ## -- rank ensemble ----

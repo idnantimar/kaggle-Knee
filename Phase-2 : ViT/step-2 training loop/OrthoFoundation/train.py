@@ -37,8 +37,8 @@ WORKING = Path("/kaggle/working/")
 DATA_ROOT = INPUT / "competitions/rsna-knee-abnormality-detection"
 PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x5gr-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
 
-ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation" # +3 percentage points over generic DINOv3 ViT-L/16.
-DINOV3_REPO, ORTHO_WEIGHTS = ORTHO / "dinov3", ORTHO / "OrthoFoundation.pt" 
+ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation" # +3 percentage points score gain over generic DINOv3 ViT-L/16.
+
  
 TARGETS = [
     "ACL", "MCL",
@@ -53,7 +53,7 @@ TARGETS = [
 # we stack 3 adjacent MRI slices as a single encoder pass.(2.5D: depth in the channels).
 RGB = 3
 
-TIME_BUDGET = 8 * 3600.  # sufficient buffer (compared to the Kaggle session limit of 12h).
+TIME_BUDGET = 10 * 3600.  # sufficient buffer (compared to the Kaggle session limit of 12h).
 
 
 # ==================================================
@@ -148,7 +148,7 @@ def _LoRA(layers: list):
     )
 
 
-def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Model:
+def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO / "OrthoFoundation.pt") -> _Model:
     """
     DINOv3 ViT-L/16 checkpoint
     ref: https://github.com/ytrsk/OrthoFoundation
@@ -162,10 +162,7 @@ def build_ortho_model(n_slot: int, checkpoint_path: Path = ORTHO_WEIGHTS) -> _Mo
     
     """
     ViT = torch.hub.load(
-        os.fspath(
-            DINOV3_REPO.parent 
-            # directory containing `hubconf.py`.
-        ), 
+        os.fspath(ORTHO), 
         "dinov3_vitl16", 
         source="local", pretrained=False,
         # architecture only; no weight download.
@@ -374,7 +371,7 @@ def _prefetch[Key, Value](load: Callable[[Key], Value], keys: Iterable[Key]) -> 
         yield key, future.result() # <last key>.
 
 
-EVAL_BATCH = 8 
+EVAL_BATCH = 48
 @torch.no_grad()
 def predict(
         model, 
@@ -440,16 +437,28 @@ RUNS = {
     # the remaining (2/5) folds are held out.
 } ## NOTE: every fold is used at least once for training.
 
-def train_run(rank: int):
+
+def train_runs_on_gpu(gpu_index: int, n_gpu: int):
     """
-    One run per GPU (cuda:rank),
-    launched in parallel via torch.multiprocessing.spawn(...).
+    One process per GPU (cuda:gpu_index), launched in parallel via torch.multiprocessing.spawn(...);
+    each process trains its share of RUNS one after another:
+        T4 x2: cuda:0 -> A;  cuda:1 -> B.
     """
-    run_name = chr(rank + 65)
+    T0 = time.time()
+    # TIME_BUDGET covers all runs of this process (one Kaggle session), not each run separately.
+    for run_index in range(gpu_index, len(RUNS), n_gpu):
+        train_run(run_index, gpu_index, T0)
+
+
+def train_run(run_index: int, gpu_index: int, T0: float):
+    """
+    One run on cuda:gpu_index.
+    """
+    run_name = chr(run_index + 65)
     # name [0, 1, ...] ---> [A, B, ...]
     train_folds = RUNS[run_name]
-    np.random.seed(SEED + rank)
-    torch.manual_seed(SEED + rank)
+    np.random.seed(SEED + run_index)
+    torch.manual_seed(SEED + run_index)
     # ensemble diversity: A/B differ in initialization, augmentation, and batch order.
 
     logging.basicConfig(
@@ -458,9 +467,8 @@ def train_run(rank: int):
         datefmt="%H:%M:%S",
         force=True,
     )
-    T0 = time.time()
     has_cuda = True
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{gpu_index}")
     torch.cuda.set_device(device)
 
     ## -- image data ----
@@ -691,6 +699,7 @@ if __name__ == "__main__":
         force=True,
     )
 
-    assert torch.cuda.device_count() >= len(RUNS), f"""need {len(RUNS)} GPUs, found {torch.cuda.device_count()}."""
-    torch.multiprocessing.spawn(train_run, nprocs=len(RUNS), join=True)
+    n_gpu = torch.cuda.device_count()
+    assert n_gpu >= 1, "need at least 1 GPU."
+    torch.multiprocessing.spawn(train_runs_on_gpu, args=(n_gpu,), nprocs=min(n_gpu, len(RUNS)), join=True)
     shutil.copy(__file__, WORKING / "train.py")
