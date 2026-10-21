@@ -1,6 +1,6 @@
 {
-  "id": "ramitnandi/rsna-knee-submit-dino",
-  "title": "rsna-knee-submit-dino",
+  "id": "ramitnandi/rsna-knee-submit-dino-final",
+  "title": "rsna-knee-submit-dino-final",
   "code_file": "submit.py",
   "language": "python",
   "kernel_type": "script",
@@ -16,7 +16,7 @@
     "rsna-knee-abnormality-detection"
   ],
   "kernel_sources": [
-    "ramitnandi/rsna-knee-train-dino"
+    "ramitnandi/rsna-knee-train-dino-final"
   ],
   "model_sources": [
     "ramitnandi/dinov3-vit/pytorch/default/1"

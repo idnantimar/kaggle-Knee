@@ -10,7 +10,7 @@ SUBMISSION:
         ├── all 24 blocks      <LoRA fine-tuned>
         └── final norm         <fine-tuned>
         +
-        SlotHead (learned attention pooling)]<ensemble model_ft_{A/B}.pt>
+        SlotHead (learned attention pooling)]<ensemble model_ft_{A/B/C/D}.pt>
 
     --predict--> submission.csv
 
@@ -31,15 +31,18 @@ from scipy.stats import rankdata
 INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
 PREP_X_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x5gr-out"  
-TRAIN_OUT = INPUT / "notebooks/ramitnandi/rsna-knee-train-ortho"  
+TRAIN_OUT_AB = INPUT / "notebooks/ramitnandi/rsna-knee-train-ortho-final-ab"  
+TRAIN_OUT_CD = INPUT / "notebooks/ramitnandi/rsna-knee-train-ortho-final-cd"  
+TRAIN_OUT = {"A": TRAIN_OUT_AB, "B": TRAIN_OUT_AB, "C": TRAIN_OUT_CD, "D": TRAIN_OUT_CD}
 
-sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT)] 
+sys.path[:0] = [str(PREP_X_OUT), str(TRAIN_OUT_AB)] 
 # prioritize over any other module with the same name.
 import prep_X
 from train import TARGETS, build_ortho_model, load_state, predict
+# the A/B kernel's train code (the C/D kernel was trained with the same code).
 
 logger = logging.getLogger(__name__)
-SUBMIT_RUNS = ['A', 'B'] 
+SUBMIT_RUNS = ['A', 'B', 'C', 'D'] 
 N_SUBMIT = len(SUBMIT_RUNS)
 
 
@@ -52,13 +55,13 @@ def main() -> pd.DataFrame:
     def predict_run(run_name: str, dev: torch.device) -> np.ndarray:
         """
         - Load the DINOv3-L architecture with OrthoFoundation weights.
-        - Overwrite fine-tuned layers using model_ft_{A/B}.pt; keep frozen layers unchanged.
+        - Overwrite fine-tuned layers using model_ft_{A/B/C/D}.pt; keep frozen layers unchanged.
         """
         if dev.type == "cuda":
             torch.cuda.set_device(dev) 
 
         model = build_ortho_model(n_slot=S).to(dev)
-        fine_tuned = torch.load(TRAIN_OUT / f"model_ft_{run_name}.pt", map_location=dev, weights_only=True)
+        fine_tuned = torch.load(TRAIN_OUT[run_name] / f"model_ft_{run_name}.pt", map_location=dev, weights_only=True)
         _, unexpected = model.load_state_dict(fine_tuned, strict=False)
         assert not unexpected
         not_loaded = {name for name, param in model.named_parameters() if param.requires_grad} - set(fine_tuned)
@@ -69,7 +72,7 @@ def main() -> pd.DataFrame:
         logger.info(f"run {run_name}: predicted {N} studies on {dev}")
         return run_pred
 
-    ## -- (T4 x2: cuda:0 -> A | cuda:1 -> B; one model per GPU at a time) ----
+    ## -- (T4 x2: cuda:0 -> A, C | cuda:1 -> B, D; one model per GPU at a time) ----
     n_gpu = torch.cuda.device_count()
     devices = [torch.device(f"cuda:{i}") for i in range(n_gpu)] if n_gpu else [torch.device("cpu")]
     n_dev = len(devices)
@@ -83,7 +86,7 @@ def main() -> pd.DataFrame:
     with ThreadPoolExecutor(max_workers=n_dev) as pool:
         run_preds = chain.from_iterable(
             pool.map(predict_runs_on_device, range(n_dev))
-            # [[dev1_run1],[dev2_run1]] --> [dev1_run1,dev2_run1];
+            # [[dev1_run1,dev1_run2],[dev2_run1,dev2_run2]] --> [dev1_run1,dev1_run2,dev2_run1,dev2_run2];
         )
     ## ---- 
 
@@ -94,7 +97,7 @@ def main() -> pd.DataFrame:
             for run_pred in run_preds
         ], axis=0,
         # given our predicted probabilities are not calibrated,
-        # the outputs from A/B may be on different scales.
+        # the outputs from A/B/C/D may be on different scales.
         # hence, average rank is used for submission rather than average score.
         #
         # NOTE: this competition only rewards macro-AUC.

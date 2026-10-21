@@ -36,6 +36,7 @@ INPUT = Path("/kaggle/input/")
 WORKING = Path("/kaggle/working/")
 DATA_ROOT = INPUT / "competitions/rsna-knee-abnormality-detection"
 PREP_X_OUT, PREP_Y_OUT = INPUT / "datasets/ramitnandi/rsna-knee-prep-x5gr-out", INPUT / "datasets/ramitnandi/rsna-knee-prep-y-out"
+LOCAL_PREP_X_OUT = Path("/tmp/rsna-knee-prep-x5gr-out") # local disk: fast I/O.
 
 ORTHO = INPUT / "models/ramitnandi/orthofoundation/pytorch/default/1/orthofoundation" # +3 percentage points score gain over generic DINOv3 ViT-L/16.
 
@@ -431,10 +432,9 @@ BATCH_STUDIES, ACCUMULATION_STEPS = 4, 2
 GRADIENT_CLIP_NORM = 1.0
 LR_HEAD, LR_BACKBONE, LR_PATCH_EMBED = 1e-3, 2e-4, 4e-5
 RUNS = {
-    "A": (0, 1, 2), 
-    "B": (2, 3, 4),
-    # run -> training folds (3/5); 
-    # the remaining (2/5) folds are held out.
+    "A": (0, 1, 2, 3), "B": (1, 2, 3, 4),
+    # run -> training folds (4/5); 
+    # the remaining (1/5) folds are held out.
 } ## NOTE: every fold is used at least once for training.
 
 
@@ -444,6 +444,8 @@ def train_runs_on_gpu(gpu_index: int, n_gpu: int):
     each process trains its share of RUNS one after another:
         T4 x2: cuda:0 -> A;  cuda:1 -> B.
     """
+    global PREP_X_OUT
+    PREP_X_OUT = LOCAL_PREP_X_OUT
     T0 = time.time()
     # TIME_BUDGET covers all runs of this process (one Kaggle session), not each run separately.
     for run_index in range(gpu_index, len(RUNS), n_gpu):
@@ -498,7 +500,7 @@ def train_run(run_index: int, gpu_index: int, T0: float):
     # X is huge (10 GB+) and stays on disk; move to GPU chunk-wise as needed.
     ## ----
 
-    ## -- train/validation 60/40 splits ----
+    ## -- train/validation 80/20 splits ----
     report = pd.read_csv(
         DATA_ROOT / "train.csv",
         usecols=["StudyInstanceUID", "Report"], dtype="string",
@@ -602,7 +604,9 @@ def train_run(run_index: int, gpu_index: int, T0: float):
         return X[batch, :, g_id * RGB:(g_id + 1) * RGB]
 
     best, best_state = -1.0, None
-    for epoch in range(EPOCHS): # [[MAIN]]
+    # schedule the learning rate by EPOCHS, then skip the final few epochs
+    # where the learning rate is too small for meaningful updates.
+    for epoch in range(EPOCHS - 5): # [[MAIN]]
         model.train()
         current_permutation = np.random.permutation(train_set)
         batches = [
@@ -668,7 +672,7 @@ def train_run(run_index: int, gpu_index: int, T0: float):
         )
                 
         # best epoch is chosen based on full holdout AUC;
-        # the annotated reference studies (~ 1.3% * 2/5) are too few to make a decision.
+        # the annotated reference studies (~ 1.3% * 1/5) are too few to make a decision.
         if holdout_auc > best:
             best = holdout_auc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items() if k in trainable}
@@ -699,6 +703,7 @@ if __name__ == "__main__":
         force=True,
     )
 
+    shutil.copytree(PREP_X_OUT, LOCAL_PREP_X_OUT)
     n_gpu = torch.cuda.device_count()
     assert n_gpu >= 1, "need at least 1 GPU."
     torch.multiprocessing.spawn(train_runs_on_gpu, args=(n_gpu,), nprocs=min(n_gpu, len(RUNS)), join=True)

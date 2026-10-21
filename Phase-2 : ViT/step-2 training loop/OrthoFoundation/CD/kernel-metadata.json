@@ -1,0 +1,25 @@
+{
+  "id": "ramitnandi/rsna-knee-train-ortho-final-cd",
+  "title": "rsna-knee-train-ortho-final-cd",
+  "code_file": "train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "ramitnandi/rsna-knee-prep-x5gr-out",
+    "ramitnandi/rsna-knee-prep-y-out"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [
+    "ramitnandi/rsna-knee-train-ortho-final-ab"
+  ],
+  "model_sources": [
+    "ramitnandi/orthofoundation/pytorch/default/1"
+  ]
+}

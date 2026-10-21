@@ -156,7 +156,7 @@ SLOTS = {
     "SAG_NONFLUID_NOFS": ("Sagittal", False, False),
     "COR_NONFLUID_NOFS": ("Coronal", False, False),
     "AX_NONFLUID_NOFS": ("Axial", False, False),
-}
+} # DO NOT change the ordering (the attention pooling prior depends on it).
 
 
 def pick_slots(header:pd.DataFrame) -> dict:

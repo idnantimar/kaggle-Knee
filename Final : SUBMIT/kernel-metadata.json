@@ -1,0 +1,27 @@
+{
+  "id": "ramitnandi/rsna-knee-submit-ensemble",
+  "title": "rsna-knee-submit-ensemble",
+  "code_file": "submit_ensemble.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "ramitnandi/rsna-knee-prep-x5gr-out"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": [
+    "ramitnandi/rsna-knee-train-ortho-final-ab",
+    "ramitnandi/rsna-knee-train-ortho-final-cd",
+    "ramitnandi/rsna-knee-train-dino-final"
+  ],
+  "model_sources": [
+    "ramitnandi/orthofoundation/pytorch/default/1",
+    "ramitnandi/dinov3-vit/pytorch/default/1"
+  ]
+}

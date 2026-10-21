@@ -1,6 +1,6 @@
 {
-  "id": "ramitnandi/rsna-knee-submit-ortho",
-  "title": "rsna-knee-submit-ortho",
+  "id": "ramitnandi/rsna-knee-submit-ortho-final",
+  "title": "rsna-knee-submit-ortho-final",
   "code_file": "submit.py",
   "language": "python",
   "kernel_type": "script",
@@ -16,7 +16,8 @@
     "rsna-knee-abnormality-detection"
   ],
   "kernel_sources": [
-    "ramitnandi/rsna-knee-train-ortho"
+    "ramitnandi/rsna-knee-train-ortho-final-ab",
+    "ramitnandi/rsna-knee-train-ortho-final-cd"
   ],
   "model_sources": [
     "ramitnandi/orthofoundation/pytorch/default/1"
