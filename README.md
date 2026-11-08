@@ -4,6 +4,10 @@ The knee is the most commonly injured and imaged joint in the body. A single kne
 
 The **2026 RSNA Knee Abnormality Detection AI Challenge** asks participants to build machine learning models that detect 12 clinically important abnormalities on knee MRI examinations: 1) ACL tear, 2) MCL tear, 3) medial meniscus tear, 4) lateral meniscus tear, 5) medial compartment osteoarthritis, 6) lateral compartment osteoarthritis, 7) patellofemoral compartment osteoarthritis, 8) joint effusion, 9) synovitis, 10) Baker cyst, 11) contusion, and 12) acute fracture.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/idnantimar/kaggle-Knee/main/poster%201080%C3%971350%402x.png" width="700">
+</p>
+
 --------
 
 ## **PROBLEM STATEMENT 🎯**
