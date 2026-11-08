@@ -255,7 +255,7 @@ class _Model(nn.Module):
         The encoder pass of scaled inputs [batch_len * n_slots, R-G-B, Height, Width] happens here.
         Extracts:
             CLS [batch_len * n_slots, dim],
-            mean(patches [batch_len * n_slots, n_patch, dim])
+            patches [batch_len * n_slots, n_patch, dim]
         """
         ViT = self.backbone
         t, (H, W) = ViT.prepare_tokens_with_masks(x)
